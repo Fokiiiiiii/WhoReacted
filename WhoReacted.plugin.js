@@ -1,11 +1,13 @@
 /**
  * @name WhoReacted
- * @author jaimeadf (original), modernized rewrite maintained via community contribution
+ * @author Fokiiiiiii (modernized rewrite), jaimeadf (original)
  * @authorId 0
  * @description Shows the avatars of the users who reacted next to each reaction pill on messages. Modernized rewrite of the original WhoReacted plugin (webpack+JSX build) to work with current Discord using resilient module discovery, function-component patching with a DOM-injection fallback, and a self-contained plain-JS build (no bundler, no ZeresPluginLibrary).
- * @version 1.0.0
+ * @version 1.0.1
+ * @authorLink https://github.com/Fokiiiiiii
  * @source https://github.com/Fokiiiiiii/WhoReacted
  * @website https://github.com/Fokiiiiiii/WhoReacted
+ * @updateUrl https://raw.githubusercontent.com/Fokiiiiiii/WhoReacted/main/WhoReacted.plugin.js
  */
 
 module.exports = class WhoReacted {
@@ -62,7 +64,7 @@ module.exports = class WhoReacted {
         // plugins/WhoReacted.config.json under the "diagnostics" key so it
         // can be inspected from the filesystem without console access.
         this.diag = {
-            pluginVersion: "1.0.0",
+            pluginVersion: "1.0.1",
             bdVersion: null,
             updates: 0,
             lastUpdate: null,

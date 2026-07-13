@@ -1,0 +1,16 @@
+# BetterDiscord runtime state and local diagnostics
+WhoReacted.config.json
+*.config.json
+diagnostics/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+
+# Build and temporary files
+node_modules/
+dist/
+build/
+*.log
+*.tmp

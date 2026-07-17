@@ -2,8 +2,8 @@
  * @name WhoReacted
  * @author Fokiiiiiii (modernized rewrite), jaimeadf (original)
  * @authorId 0
- * @description Shows the avatars of the users who reacted next to each reaction pill on messages. Modernized rewrite of the original WhoReacted plugin (webpack+JSX build) to work with current Discord using resilient module discovery, function-component patching with a DOM-injection fallback, and a self-contained plain-JS build (no bundler, no ZeresPluginLibrary).
- * @version 1.0.1
+ * @description Shows the avatars of the users who reacted next to each reaction pill on messages. Modernized rewrite of the original WhoReacted plugin (webpack+JSX build) to work with current Discord using resilient module discovery and DOM/MutationObserver injection, in a self-contained plain-JS build (no bundler, no ZeresPluginLibrary).
+ * @version 1.0.2
  * @authorLink https://github.com/Fokiiiiiii
  * @source https://github.com/Fokiiiiiii/WhoReacted
  * @website https://github.com/Fokiiiiiii/WhoReacted
@@ -34,48 +34,27 @@ module.exports = class WhoReacted {
         this.listeners = new Set();
         this.maskIdCounter = 0;
 
-        this.strategy = null; // "A" or "B"
+        this.strategy = null; // always "B" (DOM/MutationObserver injection)
         this.unpatchFns = [];
         this.observer = null;
         this.domRoots = new Map(); // element -> {root, container}
         this.pillRetryFrames = new Map(); // element -> requestAnimationFrame id
-        this.requestedFetches = new Set(); // `${channelId}:${messageId}:${emoji}` dedupe
         this.reactionUsersCache = new Map(); // reaction key -> {users, timestamp}
         this.reactionUsersCacheTtl = 5 * 60 * 1000;
         this.reactionUsersCacheMax = 500;
 
         this.started = false;
 
-        // Strategy A health tracking: incremented every time a patched render
-        // actually injected our element. Used by the watchdog to detect a
-        // "false positive" patch (wrong component / never fires) and switch
-        // to Strategy B.
-        this.injectionSuccessCount = 0;
-        this.watchdogTimer = null;
-        this.watchdogChecks = 0;
-
-        // Manual REST fetch queue (rate-limit friendly, sequential).
-        this.fetchQueue = [];
-        this.fetchQueueTimer = null;
-        this._restUnavailableLogged = false;
-        this._emojiPathNullLogged = false;
-
         // On-disk diagnostics. Persisted (throttled) to
         // plugins/WhoReacted.config.json under the "diagnostics" key so it
         // can be inspected from the filesystem without console access.
         this.diag = {
-            pluginVersion: "1.0.1",
+            pluginVersion: this.meta.version || null,
             bdVersion: null,
             updates: 0,
             lastUpdate: null,
             strategy: null,
             fallbacksUsed: [],
-            strategyA: {
-                candidateMatched: null,
-                handlerFires: 0,
-                injectionSuccesses: 0,
-                injectionFailures: 0
-            },
             strategyB: {
                 pillsSeen: 0,
                 fiberPropsFound: 0,
@@ -87,14 +66,6 @@ module.exports = class WhoReacted {
             data: {
                 getReactionsCalls: 0,
                 lastReactionsCount: -1,
-                restFetchesQueued: 0,
-                restFetchesOk: 0,
-                restFetchesFailed: 0,
-                lastRestError: null,
-                restApiFound: false,
-                dispatcherFound: false,
-                dispatcherVia: null,
-                fetchReactionsActionFound: false,
                 reactionCacheHits: 0,
                 reactionCacheEntries: 0,
                 lastEffectiveCount: 0,
@@ -138,12 +109,9 @@ module.exports = class WhoReacted {
 
             this.started = true;
 
-            // Current Discord reaction components are frequently returned as
-            // bare minified exports. Finding a source-string match does not
-            // prove that BetterDiscord can patch the live call site, which
-            // made Strategy A report success while its handler never fired.
-            // Strategy B works from the rendered pill and remains valid when
-            // pills appear long after startup, so use it as the primary path.
+            // DOM/MutationObserver injection works directly from the rendered
+            // pill and stays valid even when pills first appear long after
+            // startup, so it is the only injection strategy used.
             this.strategy = "B";
             BdApi.Logger.info(this.name, "Using strategy B (DOM/MutationObserver injection).");
             this._startStrategyB();
@@ -164,13 +132,6 @@ module.exports = class WhoReacted {
         } catch (err) {
             this._logError("Error while unpatching:", err);
         }
-
-        if (this.watchdogTimer) {
-            clearInterval(this.watchdogTimer);
-            this.watchdogTimer = null;
-        }
-        this.watchdogChecks = 0;
-        this.injectionSuccessCount = 0;
 
         try {
             if (this.observer) {
@@ -200,18 +161,11 @@ module.exports = class WhoReacted {
             this._logError("Error removing style:", err);
         }
 
-        if (this.fetchQueueTimer) {
-            clearTimeout(this.fetchQueueTimer);
-            this.fetchQueueTimer = null;
-        }
-        this.fetchQueue = [];
-
         if (this._diagSaveTimer) {
             clearTimeout(this._diagSaveTimer);
             this._diagSaveTimer = null;
         }
 
-        this.requestedFetches.clear();
         this.reactionUsersCache.clear();
         this.strategy = null;
         this.started = false;
@@ -234,6 +188,30 @@ module.exports = class WhoReacted {
      *  Settings persistence + pub/sub
      * ------------------------------------------------------------------ */
 
+    // Clamps/coerces settings loaded from disk to the ranges the settings
+    // panel actually allows, so a corrupted or hand-edited settings file
+    // can't push out-of-range values into rendering.
+    _normalizeSettings(raw) {
+        const s = Object.assign({}, this.defaults, raw && typeof raw === "object" ? raw : {});
+        const clamp = (value, min, max, fallback) => {
+            const n = Number(value);
+            return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+        };
+
+        s.max = clamp(s.max, 1, 20, this.defaults.max);
+        s.avatarSize = clamp(s.avatarSize, 8, 48, this.defaults.avatarSize);
+        s.avatarOverlap = clamp(s.avatarOverlap, 0, 100, this.defaults.avatarOverlap);
+        s.avatarSpacing = clamp(s.avatarSpacing, 0, 50, this.defaults.avatarSpacing);
+        s.emojiThreshold = clamp(s.emojiThreshold, 0, 20, this.defaults.emojiThreshold);
+        s.reactionsTotalThreshold = clamp(s.reactionsTotalThreshold, 0, 10000, this.defaults.reactionsTotalThreshold);
+        s.reactionsPerEmojiThreshold = clamp(s.reactionsPerEmojiThreshold, 0, 500, this.defaults.reactionsPerEmojiThreshold);
+        s.hideSelf = Boolean(s.hideSelf);
+        s.hideBots = Boolean(s.hideBots);
+        s.hideBlocked = Boolean(s.hideBlocked);
+
+        return s;
+    }
+
     _loadSettings() {
         let saved = null;
         try {
@@ -241,7 +219,7 @@ module.exports = class WhoReacted {
         } catch (err) {
             this._logError("Failed to load settings:", err);
         }
-        this.settings = Object.assign({}, this.defaults, saved || {});
+        this.settings = this._normalizeSettings(saved);
     }
 
     _saveSettings() {
@@ -315,120 +293,6 @@ module.exports = class WhoReacted {
     }
 
     /* ------------------------------------------------------------------ *
-     *  Manual reactor fetch (REST + Flux dispatch)
-     * ------------------------------------------------------------------ */
-
-    _emojiApiPath(emoji) {
-        if (!emoji) return null;
-        try {
-            if (typeof emoji === "string") return emoji;
-            if (typeof emoji !== "object" || typeof emoji.name !== "string") return null;
-            return emoji.name + (emoji.id ? `:${emoji.id}` : "");
-        } catch (err) {
-            this._logError("_emojiApiPath threw:", err);
-            return null;
-        }
-    }
-
-    _enqueueRestFetch(channelId, messageId, emoji, type) {
-        if (!this.mods.RestAPI || !this.mods.FluxDispatcher) {
-            // The reaction store may already contain the users (and usually
-            // does on current Discord). Do not turn an optional fallback into
-            // a persistent error when no verified internal REST module exists.
-            return;
-        }
-        // Cap pending work so a huge scrollback can't build an endless queue.
-        if (this.fetchQueue.length > 100) return;
-
-        const dedupeKey = `${channelId}:${messageId}:${emoji && (emoji.id || emoji.name)}:${type || 0}`;
-        this.fetchQueue.push({ channelId, messageId, emoji, type, dedupeKey });
-        this.diag.data.restFetchesQueued++;
-        this._saveDiag(false);
-        this._pumpFetchQueue();
-    }
-
-    // Sequential queue with ~300ms between requests for rate-limit safety.
-    _pumpFetchQueue() {
-        if (this.fetchQueueTimer || this.fetchQueue.length === 0) return;
-
-        this.fetchQueueTimer = setTimeout(async () => {
-            this.fetchQueueTimer = null;
-            const job = this.fetchQueue.shift();
-            if (job && this.started) {
-                try {
-                    await this._doRestFetch(job);
-                } catch (err) {
-                    this._logError("REST fetch job failed:", err);
-                }
-            }
-            if (this.started && this.fetchQueue.length > 0) {
-                this._pumpFetchQueue();
-            }
-        }, 300);
-    }
-
-    async _doRestFetch(job) {
-        const { channelId, messageId, emoji, type } = job;
-        const RestAPI = this.mods.RestAPI;
-        const FluxDispatcher = this.mods.FluxDispatcher;
-        if (!RestAPI || !FluxDispatcher || !channelId || !messageId) return;
-
-        const emojiPath = this._emojiApiPath(emoji);
-
-        if (!emojiPath) {
-            if (!this._emojiPathNullLogged) {
-                this._emojiPathNullLogged = true;
-                this._logError("WARNING: _doRestFetch got null emojiPath, skipping REST fetch");
-            }
-            return;
-        }
-
-        let url = null;
-        try {
-            const reactionsEndpoint = this.mods.Endpoints && this.mods.Endpoints.REACTIONS;
-            url = typeof reactionsEndpoint === "function"
-                ? reactionsEndpoint(channelId, messageId, emojiPath)
-                : `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emojiPath)}`;
-        } catch (err) {
-            url = `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emojiPath)}`;
-        }
-
-        try {
-            const response = await RestAPI.get({
-                url,
-                query: { limit: 100, type: type || 0 },
-                oldFormErrors: true
-            });
-            const users = response && response.body;
-
-            if (Array.isArray(users)) {
-                for (const user of users) {
-                    FluxDispatcher.dispatch({ type: "USER_UPDATE", user });
-                }
-                FluxDispatcher.dispatch({
-                    type: "MESSAGE_REACTION_ADD_USERS",
-                    channelId,
-                    messageId,
-                    users,
-                    emoji,
-                    reactionType: type || 0
-                });
-                this.diag.data.restFetchesOk++;
-            } else {
-                this.diag.data.restFetchesFailed++;
-                this.diag.data.lastRestError = `Unexpected response body: ${typeof users}`;
-                if (job.dedupeKey) this.requestedFetches.delete(job.dedupeKey);
-            }
-        } catch (err) {
-            this.diag.data.restFetchesFailed++;
-            this.diag.data.lastRestError = err && err.message ? String(err.message) : String(err);
-            if (job.dedupeKey) this.requestedFetches.delete(job.dedupeKey);
-            this._logError("_doRestFetch failed:", err);
-        }
-        this._saveDiag(false);
-    }
-
-    /* ------------------------------------------------------------------ *
      *  Module resolution
      * ------------------------------------------------------------------ */
 
@@ -486,101 +350,15 @@ module.exports = class WhoReacted {
             this.mods.useStateFromStores = this._manualUseStateFromStores.bind(this);
         }
 
-        // Optional: fetchReactions action, used as the primary nudge.
-        // NOTE: byKeys returns the MODULE that HAS the key — extract and
-        // bind the actual function off it.
-        try {
-            const actionModule = Webpack.getModule(Filters.byKeys("fetchReactions"));
-            this.mods.fetchReactions = actionModule && typeof actionModule.fetchReactions === "function"
-                ? actionModule.fetchReactions.bind(actionModule)
-                : null;
-        } catch (err) {
-            this.mods.fetchReactions = null;
-        }
-        this.diag.data.fetchReactionsActionFound = typeof this.mods.fetchReactions === "function";
-
-        // Optional: RestAPI + FluxDispatcher, used for the manual reactor
-        // fetch fallback (Discord does not populate MessageReactionsStore
-        // until something requests the reactor list).
-        // Do not select RestAPI by generic method names. Current Discord has
-        // unrelated modules with get/post/put/patch/del whose get() accepts a
-        // URL string; calling one with Discord's {url, query} request object
-        // reaches XMLHttpRequest.open with a non-string URL and throws
-        // "t[1].toLowerCase is not a function". Until an internal module can
-        // be identified by a stable source marker, rely on the reaction store.
-        const RestAPI = null;
-        this.mods.RestAPI = RestAPI;
-        this.diag.data.restApiFound = !!RestAPI;
-        if (!RestAPI) fallbacksUsed.push("RestAPI not found (manual reactor fetch disabled)");
-
-        try {
-            const constants = Webpack.getModule(Filters.byKeys("Endpoints"));
-            this.mods.Endpoints = constants && constants.Endpoints;
-        } catch (err) {
-            this.mods.Endpoints = null;
-        }
-
-        // FluxDispatcher. On current builds the dispatcher is a class
-        // instance whose methods live on the PROTOTYPE, so key-based filters
-        // (Object.keys) miss it — function-shape checks via property access
-        // reach prototype methods. Most reliable of all: grab the dispatcher
-        // off an already-resolved Flux store.
-        let dispatcher = null;
-        let dispatcherVia = null;
-
-        const isDispatcher = d => d && typeof d.dispatch === "function";
-
-        // 1. From an already-resolved store's internals.
-        for (const store of [this.mods.UserStore, this.mods.ChannelStore, this.mods.ReactionStore, this.mods.RelationshipStore]) {
-            if (!store) continue;
-            try {
-                if (isDispatcher(store._dispatcher)) {
-                    dispatcher = store._dispatcher;
-                    dispatcherVia = "store._dispatcher";
-                    break;
-                }
-                const viaGetter = typeof store.getDispatcher === "function" ? store.getDispatcher() : null;
-                if (isDispatcher(viaGetter)) {
-                    dispatcher = viaGetter;
-                    dispatcherVia = "store.getDispatcher()";
-                    break;
-                }
-            } catch (err) { /* try next store */ }
-        }
-
-        // 2. Function-shape module filter (reaches prototype methods).
-        if (!dispatcher) {
-            try {
-                const found = Webpack.getModule(m => m && typeof m.dispatch === "function" && typeof m.subscribe === "function");
-                if (isDispatcher(found)) {
-                    dispatcher = found;
-                    dispatcherVia = "shape filter";
-                }
-            } catch (err) { /* try next */ }
-        }
-
-        // 3. Same filter over exports.
-        if (!dispatcher) {
-            try {
-                const found = Webpack.getModule(
-                    m => m && typeof m.dispatch === "function" && typeof m.subscribe === "function",
-                    { searchExports: true }
-                );
-                if (isDispatcher(found)) {
-                    dispatcher = found;
-                    dispatcherVia = "shape filter (searchExports)";
-                }
-            } catch (err) { /* optional */ }
-        }
-
-        this.mods.FluxDispatcher = dispatcher;
-        this.diag.data.dispatcherFound = !!dispatcher;
-        this.diag.data.dispatcherVia = dispatcherVia;
-        if (dispatcher) {
-            if (dispatcherVia !== "shape filter") fallbacksUsed.push(`FluxDispatcher via ${dispatcherVia}`);
-        } else {
-            fallbacksUsed.push("FluxDispatcher not found (manual reactor fetch disabled)");
-        }
+        // NOTE: an earlier revision tried to actively fetch missing reactor
+        // lists via a generically-detected RestAPI module. Current Discord
+        // has unrelated modules with get/post/put/patch/del whose get()
+        // accepts a URL string; calling one with Discord's {url, query}
+        // request object reached XMLHttpRequest.open with a non-string URL
+        // and threw "t[1].toLowerCase is not a function". Until an internal
+        // module can be identified by a stable source marker, do not
+        // reintroduce that lookup — rely on the reaction store instead
+        // (shows a "+N" count badge until Discord populates it itself).
 
         this._fallbacksUsed = fallbacksUsed;
         this.diag.fallbacksUsed = fallbacksUsed;
@@ -942,16 +720,22 @@ module.exports = class WhoReacted {
         return `${channelId || ""}:${messageId || ""}:${emoji && (emoji.id || emoji.name) || ""}:${type || 0}`;
     }
 
+    // message.reactions is a plain array on most builds, but some Discord
+    // versions expose a Collection-like object instead — normalize both
+    // shapes so callers never have to special-case it.
+    _reactionsArray(message) {
+        if (!message || !message.reactions) return [];
+        if (Array.isArray(message.reactions)) return message.reactions;
+        if (typeof message.reactions.toArray === "function") return message.reactions.toArray();
+        return [];
+    }
+
     _effectiveReactionCount(message, emoji, type, suppliedCount, knownUsersCount) {
         const direct = Number(suppliedCount);
         if (Number.isFinite(direct) && direct > 0) return direct;
 
         try {
-            const reactions = Array.isArray(message && message.reactions)
-                ? message.reactions
-                : message && message.reactions && typeof message.reactions.toArray === "function"
-                    ? message.reactions.toArray()
-                    : [];
+            const reactions = this._reactionsArray(message);
             const match = reactions.find(reaction => {
                 const reactionEmoji = reaction && reaction.emoji;
                 if (!reactionEmoji || !emoji) return false;
@@ -1079,21 +863,10 @@ module.exports = class WhoReacted {
 
         // Discord does NOT populate MessageReactionsStore until something
         // requests the reactor list (normally hovering the reaction
-        // tooltip). If the store came back empty, actively request it:
-        // prefer Discord's own fetchReactions action; else fall back to a
-        // manual REST fetch + MESSAGE_REACTION_ADD_USERS dispatch (the
-        // approach proven by Vencord's whoReacted). Deduped per reaction.
-        BdApi.React.useEffect(() => {
-            if (!message || !emoji) return;
-            if (rawUsers.length > 0) return;
-            if (!channelId || !messageId) return;
-
-            const dedupeKey = `${channelId}:${messageId}:${emoji && (emoji.id || emoji.name)}:${type || 0}`;
-            if (self.requestedFetches.has(dedupeKey)) return;
-            self.requestedFetches.add(dedupeKey);
-
-            self._enqueueRestFetch(channelId, messageId, emoji, type);
-        }, [channelId, messageId, rawUsers.length]);
+        // tooltip). No internal module could be identified that reliably
+        // triggers this fetch without risking a crash (see _resolveModules
+        // history), so until then this shows a "+N" count badge instead of
+        // avatars for reactions the store hasn't been asked about yet.
 
         // ---- all hooks are done; conditions may return early from here ----
 
@@ -1103,22 +876,17 @@ module.exports = class WhoReacted {
 
         function shouldHide() {
             try {
-                if (!isThresholdDisabled(settings.emojiThreshold)) {
-                    if (message && Array.isArray(message.reactions) && message.reactions.length > settings.emojiThreshold) {
-                        return true;
-                    }
+                const reactions = self._reactionsArray(message);
+                if (!isThresholdDisabled(settings.emojiThreshold) && reactions.length > settings.emojiThreshold) {
+                    return true;
                 }
                 if (!isThresholdDisabled(settings.reactionsTotalThreshold)) {
-                    if (message && Array.isArray(message.reactions)) {
-                        const total = message.reactions.reduce((sum, r) => sum + (r && r.count ? r.count : 0), 0);
-                        if (total > settings.reactionsTotalThreshold) return true;
-                    }
+                    const total = reactions.reduce((sum, r) => sum + (r && r.count ? r.count : 0), 0);
+                    if (total > settings.reactionsTotalThreshold) return true;
                 }
                 if (!isThresholdDisabled(settings.reactionsPerEmojiThreshold)) {
-                    if (message && Array.isArray(message.reactions)) {
-                        for (const r of message.reactions) {
-                            if (r && r.count > settings.reactionsPerEmojiThreshold) return true;
-                        }
+                    for (const r of reactions) {
+                        if (r && r.count > settings.reactionsPerEmojiThreshold) return true;
                     }
                 }
             } catch (err) {
@@ -1166,338 +934,6 @@ module.exports = class WhoReacted {
         // so React preserves component state across re-renders instead of
         // remounting a fresh anonymous component every time.
         return this._h(this.RootC, { message, emoji, count, type });
-    }
-
-    /* ------------------------------------------------------------------ *
-     *  Strategy A: patch the Reaction component
-     * ------------------------------------------------------------------ */
-
-    _tryStrategyA() {
-        const candidates = this._getStrategyACandidates();
-
-        for (const candidate of candidates) {
-            let located = null;
-            try {
-                located = candidate();
-            } catch (err) {
-                this._logError(`Strategy A candidate "${candidate.label || "?"}" threw during lookup:`, err);
-            }
-
-            if (!located) continue;
-
-            const patched = this._patchLocatedComponent(located);
-            if (patched) {
-                BdApi.Logger.info(this.name, `Strategy A: patched via candidate "${located.label}".`);
-                this.diag.strategyA.candidateMatched = located.label;
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    _getStrategyACandidates() {
-        const Webpack = BdApi.Webpack;
-        const Filters = Webpack.Filters;
-        const self = this;
-
-        const candidates = [];
-
-        // 1. Original heuristic: component whose .type stringifies with a
-        // recognizable prop name. May still work on some builds.
-        candidates.push(() => {
-            const mod = Webpack.getModule(
-                m => m && m.type && typeof m.type.toString === "function" && m.type.toString().includes("burstReactionsEnabled"),
-                { searchExports: true }
-            );
-            if (!mod) return null;
-            return self._describeLocated(mod, "burstReactionsEnabled heuristic (legacy)");
-        });
-
-        // 2. Data-driven list of source-string candidates for the reaction
-        // pill component. Each is tried via byStrings + searchExports.
-        const sourceStringSets = [
-            ["useReactionTooltip"],
-            ["reactionTooltip"],
-            ["isBurstReaction"],
-            ["reaction.emoji", "onContextMenu"],
-            [".burst", "reaction"]
-        ];
-
-        for (const strings of sourceStringSets) {
-            candidates.push(() => {
-                let mod = null;
-                try {
-                    mod = Webpack.getModule(Filters.byStrings.apply(Filters, strings), { searchExports: true });
-                } catch (err) {
-                    return null;
-                }
-                if (!mod) return null;
-                return self._describeLocated(mod, `byStrings(${strings.join(",")})`);
-            });
-
-            // Also try getBySource / getWithKey if the harness exposes them.
-            candidates.push(() => {
-                if (typeof Webpack.getBySource !== "function") return null;
-                let mod = null;
-                try {
-                    mod = Webpack.getBySource(strings[0]);
-                } catch (err) {
-                    return null;
-                }
-                if (!mod) return null;
-                return self._describeLocated(mod, `getBySource(${strings[0]})`);
-            });
-        }
-
-        return candidates;
-    }
-
-    // Normalizes a located module value into {value, container, key, label}
-    // where `container[key] === value` when we have enough information to
-    // patch it directly, otherwise we patch `value` (or `value.type`) itself.
-    _describeLocated(value, label) {
-        return { value, label };
-    }
-
-    _patchLocatedComponent(located) {
-        const value = located.value;
-        const label = located.label;
-        const self = this;
-
-        const afterHandler = (thisObj, args, returnValue) => {
-            return self._handlePatchedRender(thisObj, args, returnValue);
-        };
-
-        try {
-            if (typeof value === "function") {
-                // A bare function export (resolved via searchExports) can only
-                // be intercepted by patching the property on its owning
-                // module's exports object — patching a throwaway wrapper
-                // object would never fire since nothing calls through it.
-                // Succeed ONLY if we can locate and patch the real export
-                // slot; otherwise report failure so the next candidate (or
-                // Strategy B) gets a chance.
-                const ownerPatched = this._patchOwningModuleExport(value, afterHandler);
-                if (ownerPatched) {
-                    this.unpatchFns.push(ownerPatched);
-                    return true;
-                }
-                return false;
-            }
-
-            if (value && typeof value === "object" && typeof value.type === "function") {
-                const unpatch = BdApi.Patcher.after(this.name, value, "type", afterHandler);
-                this.unpatchFns.push(unpatch);
-                return true;
-            }
-
-            if (value && typeof value === "object" && typeof value.render === "function") {
-                const unpatch = BdApi.Patcher.after(this.name, value, "render", afterHandler);
-                this.unpatchFns.push(unpatch);
-                return true;
-            }
-        } catch (err) {
-            this._logError(`Failed to patch candidate "${label}":`, err);
-        }
-
-        return false;
-    }
-
-    // Best-effort: re-resolve the raw module wrapper so we can patch the
-    // actual exports object property (needed for Patcher.after to intercept
-    // calls made via `exports.X(...)` from other modules).
-    _patchOwningModuleExport(fnValue, afterHandler) {
-        try {
-            const Webpack = BdApi.Webpack;
-            const raw = Webpack.getModule(m => {
-                if (!m) return false;
-                for (const key of Object.keys(m)) {
-                    if (m[key] === fnValue) return true;
-                }
-                return false;
-            }, { raw: true });
-
-            if (!raw || !raw.exports) return null;
-
-            for (const key of Object.keys(raw.exports)) {
-                if (raw.exports[key] === fnValue) {
-                    return BdApi.Patcher.after(this.name, raw.exports, key, afterHandler);
-                }
-            }
-        } catch (err) {
-            // Non-fatal; returning null makes the caller treat this
-            // candidate as failed so other candidates / Strategy B can run.
-        }
-        return null;
-    }
-
-    _handlePatchedRender(thisObj, args, returnValue) {
-        try {
-            this.diag.strategyA.handlerFires++;
-            const props = (args && args[0]) || (thisObj && thisObj.props) || null;
-            let message, emoji, count, type;
-
-            if (props && props.message && props.emoji) {
-                ({ message, emoji, count, type } = props);
-            } else {
-                // Try to find reaction-shaped props deeper in the arguments.
-                const found = BdApi.Utils.findInTree(args, n => n && n.message && n.emoji, {
-                    walkable: ["props", "children"],
-                    maxProperties: 50
-                });
-                if (found) {
-                    ({ message, emoji, count, type } = found);
-                }
-            }
-
-            if (!message || !emoji) {
-                // Can't identify what reaction this is; leave render untouched.
-                return returnValue;
-            }
-
-            const reactorsElement = this._renderReactorsElement(message, emoji, count, type);
-            const injected = this._instrumentTree(returnValue, reactorsElement, 10);
-
-            if (injected) {
-                this.injectionSuccessCount++;
-                this.diag.strategyA.injectionSuccesses++;
-                this._saveDiag(false);
-            } else {
-                this.diag.strategyA.injectionFailures++;
-                this._logError("Strategy A: located component but could not find an injection point in its render tree.");
-            }
-        } catch (err) {
-            this._logError("Error while handling patched render:", err);
-        }
-
-        return returnValue;
-    }
-
-    // Generic, non-fixed-index tree walker that finds a place to append our
-    // element. Mirrors the *shape* of the original's manual traversal
-    // (tooltip render-prop -> popout render-prop -> children array) but
-    // discovers each step dynamically instead of hardcoding indices.
-    _instrumentTree(node, element, depth) {
-        if (depth <= 0 || node == null || typeof node !== "object") return false;
-
-        if (Array.isArray(node)) {
-            for (const child of node) {
-                if (this._instrumentTree(child, element, depth - 1)) return true;
-            }
-            return false;
-        }
-
-        if (!node.props) return false;
-
-        const children = node.props.children;
-
-        if (typeof children === "function") {
-            const original = children;
-            const self = this;
-            node.props.children = function (...cbArgs) {
-                const result = original.apply(this, cbArgs);
-                const injected = self._instrumentTree(result, element, depth - 1);
-                if (!injected) {
-                    self._appendFallback(result, element);
-                }
-                return result;
-            };
-            return true; // handled lazily when the render-prop is invoked
-        }
-
-        if (Array.isArray(children)) {
-            children.push(element);
-            return true;
-        }
-
-        if (children && typeof children === "object") {
-            return this._instrumentTree(children, element, depth - 1);
-        }
-
-        return false;
-    }
-
-    _appendFallback(result, element) {
-        try {
-            if (Array.isArray(result)) {
-                result.push(element);
-                return true;
-            }
-            if (result && result.props) {
-                if (Array.isArray(result.props.children)) {
-                    result.props.children.push(element);
-                    return true;
-                }
-                if (result.props.children != null && typeof result.props.children !== "function") {
-                    result.props.children = [result.props.children, element];
-                    return true;
-                }
-            }
-        } catch (err) {
-            this._logError("Fallback append failed:", err);
-        }
-        return false;
-    }
-
-    // Watchdog for Strategy A false positives: a candidate may patch a
-    // component that never renders (or that we can't inject into). If
-    // reaction pills are visibly on screen but our patch has never
-    // successfully injected, abandon Strategy A and switch to Strategy B.
-    _startStrategyAWatchdog() {
-        this.watchdogChecks = 0;
-        if (this.watchdogTimer) {
-            clearInterval(this.watchdogTimer);
-        }
-
-        this.watchdogTimer = setInterval(() => {
-            try {
-                this.watchdogChecks++;
-
-                if (!this.started || this.strategy !== "A") {
-                    clearInterval(this.watchdogTimer);
-                    this.watchdogTimer = null;
-                    return;
-                }
-
-                if (this.injectionSuccessCount > 0) {
-                    // Strategy A is demonstrably working; stop checking.
-                    clearInterval(this.watchdogTimer);
-                    this.watchdogTimer = null;
-                    return;
-                }
-
-                const pillOnScreen = document.querySelector('[class*="reactions_"] [class*="reaction_"]');
-
-                if (pillOnScreen) {
-                    // Pills exist but our patch never injected: false positive.
-                    BdApi.Logger.warn(
-                        this.name,
-                        "Strategy A watchdog: reaction pills are on screen but the patched component never injected; switching to strategy B."
-                    );
-                    clearInterval(this.watchdogTimer);
-                    this.watchdogTimer = null;
-                    // Our patches only target the (mis-identified) reaction
-                    // component, so removing them all is safe.
-                    try { BdApi.Patcher.unpatchAll(this.name); } catch (err) { /* ignore */ }
-                    this.strategy = "B";
-                    this.diag.strategy = "B (watchdog fallback)";
-                    this._saveDiag(true);
-                    this._startStrategyB();
-                    return;
-                }
-
-                if (this.watchdogChecks >= 3) {
-                    // No pills ever appeared while we were watching; nothing
-                    // to conclude. Stop the watchdog and leave Strategy A in
-                    // place (it may still work when pills first render).
-                    clearInterval(this.watchdogTimer);
-                    this.watchdogTimer = null;
-                }
-            } catch (err) {
-                this._logError("Strategy A watchdog check failed:", err);
-            }
-        }, 10000);
     }
 
     /* ------------------------------------------------------------------ *
@@ -1687,37 +1123,6 @@ module.exports = class WhoReacted {
         }
 
         this.domRoots.set(pillEl, { root, container, pillEl, reactionKey });
-    }
-
-    // Locates the pill's inner flex-row wrapper (emoji + count row) so the
-    // injected avatars sit horizontally next to the count. Fallback chain:
-    // 1. [class*="reactionInner"]
-    // 2. first child element containing both an emoji image (img/picture)
-    //    and some text (the count)
-    // 3. the deepest single-wrapper chain child of the pill
-    // 4. the pill itself
-    _findPillInnerWrapper(pillEl) {
-        try {
-            const byClass = pillEl.querySelector('[class*="reactionInner"]');
-            if (byClass) return byClass;
-
-            for (const child of pillEl.children) {
-                const hasEmoji = !!child.querySelector("img, picture");
-                const hasText = (child.textContent || "").trim().length > 0;
-                if (hasEmoji && hasText) return child;
-            }
-
-            // Deepest single-wrapper chain: pill > wrapper > wrapper > ...
-            let node = pillEl;
-            let depth = 0;
-            while (node.children.length === 1 && depth < 5) {
-                node = node.children[0];
-                depth++;
-            }
-            if (node !== pillEl) return node;
-        } catch (err) { /* fall through */ }
-
-        return pillEl;
     }
 
     // Walks up from the pill's fiber collecting the prop KEYS at each level

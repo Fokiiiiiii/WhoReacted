@@ -10,7 +10,7 @@ BetterDiscord plugin that shows the avatars of people who reacted next to each r
 - Optional filters for yourself, bots, and blocked users
 - Resilient runtime discovery for current Discord builds
 - Plain, single-file JavaScript: no bundler and no ZeresPluginLibrary dependency
-- Uses a cache and DOM fallback to reduce repeated requests and survive UI updates
+- Caches the last known reactor list per reaction so avatars don't flash away during Discord's virtualized re-renders
 
 ## Installation
 
@@ -23,7 +23,7 @@ The file must retain the `.plugin.js` extension. Do not install the repository's
 
 ## Updates
 
-The canonical update source is the fixed `main`-branch plugin URL in the metadata (`@source` and `@updateUrl`). To publish an update, keep `WhoReacted.plugin.js` at the repository root, bump the `@version` and matching diagnostic version, push the file to `main`, then create a matching Git tag and GitHub release. BetterDiscord's official update tracking uses the fixed source URL plus the version bump; `@updateUrl` is included as a compatibility hint for clients that recognize it and is not a separate download location.
+The canonical update source is the fixed `main`-branch plugin URL in the metadata (`@source` and `@updateUrl`). To publish an update, keep `WhoReacted.plugin.js` at the repository root, bump the `@version`, push the file to `main`, then create a matching Git tag and GitHub release. BetterDiscord's official update tracking uses the fixed source URL plus the version bump; `@updateUrl` is included as a compatibility hint for clients that recognize it and is not a separate download location.
 
 Raw plugin download: <https://raw.githubusercontent.com/Fokiiiiiii/WhoReacted/main/WhoReacted.plugin.js>
 
@@ -33,14 +33,14 @@ Open the plugin's settings from BetterDiscord. You can adjust:
 
 - Maximum visible avatars
 - Avatar size, overlap, and spacing
-- Fetch thresholds for large reaction sets
+- Hide thresholds for large reaction sets (skip rendering avatars above a configurable emoji/reaction count)
 - Whether to hide your own avatar, bot accounts, or blocked users
 
 ## Known limitations
 
-Discord's internal React components and stores are private implementation details and can change without notice. A Discord update may temporarily require a compatibility update. The plugin intentionally falls back to DOM/Fiber inspection when the preferred component hook is unavailable.
+Discord's internal React components and stores are private implementation details and can change without notice. A Discord update may temporarily require a compatibility update. The plugin injects avatars by observing rendered reaction pills directly (DOM/Fiber inspection) rather than patching Discord's internal components, which stays valid even when pills first appear long after the plugin starts.
 
-The plugin does not bypass Discord permissions or expose users who cannot be returned by Discord's own reaction data. Avatar fetching is subject to Discord's rate limits and the permissions available to the current client.
+The plugin does not bypass Discord permissions or expose users who cannot be returned by Discord's own reaction data. It does not proactively fetch reactor lists from Discord's API — it only displays what Discord's client has already loaded (typically after the native reaction tooltip has been hovered once). Until that happens, a message shows a `+N` count badge instead of avatars.
 
 ## BetterDiscord notes
 

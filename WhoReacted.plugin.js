@@ -31,6 +31,9 @@ module.exports = class WhoReacted {
         this.modules = {};
         this.unpatches = [];
         this.started = false;
+        this.moduleRetryTimer = null;
+        this.moduleRetryAttempts = 0;
+        this.moduleRetryLimit = 10;
 
         this.reactionRevision = 0;
         this.reactionCache = new Map();
@@ -45,27 +48,58 @@ module.exports = class WhoReacted {
     }
 
     start() {
+        this.moduleRetryAttempts = 0;
         this._loadSettings();
         this._injectStyles();
+        this.started = true;
+        this._startWhenModulesReady();
+    }
+
+    _startWhenModulesReady() {
+        if (!this.started) return;
 
         if (!this._resolveModules()) {
-            this._removeStyles();
-            this._showToast("WhoReacted: Discordのリアクションモジュールを取得できませんでした。", "error");
+            this._scheduleModuleRetry();
             return;
         }
 
-        this.started = true;
+        this.moduleRetryAttempts = 0;
         this._subscribeReactionStore();
 
         if (!this._patchReaction()) {
-            this.started = false;
-            this._unsubscribeReactionStore();
-            this._removeStyles();
-            this._showToast("WhoReacted: リアクションコンポーネントを取得できませんでした。", "error");
+            this._scheduleModuleRetry();
         }
     }
 
+    _scheduleModuleRetry() {
+        if (!this.started || this.moduleRetryTimer) return;
+
+        if (this.moduleRetryAttempts >= this.moduleRetryLimit) {
+            this._failStart("WhoReacted: Discordのリアクションモジュールを取得できませんでした。");
+            return;
+        }
+
+        this.moduleRetryAttempts++;
+        this.moduleRetryTimer = setTimeout(() => {
+            this.moduleRetryTimer = null;
+            this._startWhenModulesReady();
+        }, 500);
+    }
+
+    _failStart(message) {
+        this.started = false;
+        this._unsubscribeReactionStore();
+        this._removeStyles();
+        this._showToast(message, "error");
+    }
+
     stop() {
+        if (this.moduleRetryTimer) {
+            clearTimeout(this.moduleRetryTimer);
+            this.moduleRetryTimer = null;
+        }
+        this.moduleRetryAttempts = 0;
+
         try {
             if (typeof BdApi !== "undefined" && BdApi.Patcher) {
                 BdApi.Patcher.unpatchAll(this.name);
@@ -97,7 +131,7 @@ module.exports = class WhoReacted {
     }
 
     _resolveModules() {
-        const Webpack = BdApi && BdApi.Webpack;
+        const Webpack = typeof BdApi !== "undefined" && BdApi.Webpack;
         const Filters = Webpack && Webpack.Filters;
         if (!Webpack || !Filters) return false;
 
@@ -114,10 +148,13 @@ module.exports = class WhoReacted {
         const getStore = (name, keys) => {
             let module = null;
             try {
-                if (typeof Webpack.getStore === "function") module = Webpack.getStore(name);
+                if (typeof Webpack.getStore === "function") {
+                    module = Webpack.getStore(name);
+                }
             } catch (err) {
                 this._log("Store lookup failed:", name, err);
             }
+
             if (!module) {
                 try {
                     const filter = byKeys(...keys);
@@ -135,22 +172,23 @@ module.exports = class WhoReacted {
         this.modules.RelationshipStore = getStore("RelationshipStore", ["isBlocked"]);
 
         try {
-            this.modules.useStateFromStores = Webpack.getModule(
-                Filters.byStrings("useStateFromStores"),
-                { searchExports: true }
-            );
+            const useStateFilter = typeof Filters.byStrings === "function"
+                ? Filters.byStrings("useStateFromStores")
+                : null;
+            this.modules.useStateFromStores = useStateFilter
+                ? Webpack.getModule(useStateFilter, { searchExports: true })
+                : null;
         } catch (err) {
             this.modules.useStateFromStores = null;
         }
 
-        try {
-            this.modules.ConnectedReaction = Webpack.getModule(
-                module => module?.type?.toString?.()?.includes("burstReactionsEnabled"),
-                { searchExports: true }
-            );
-        } catch (err) {
-            this.modules.ConnectedReaction = null;
-        }
+        this.modules.ConnectedReaction = this._findConnectedReaction(Webpack, Filters);
+        this.moduleResolution = {
+            reactionStore: Boolean(this.modules.ReactionStore),
+            channelStore: Boolean(this.modules.ChannelStore),
+            userStore: Boolean(this.modules.UserStore),
+            connectedReaction: Boolean(this.modules.ConnectedReaction)
+        };
 
         return Boolean(
             this.modules.ReactionStore &&
@@ -161,37 +199,125 @@ module.exports = class WhoReacted {
         );
     }
 
+    _findConnectedReaction(Webpack, Filters) {
+        const normalize = candidate => {
+            if (!candidate) return null;
+            if (candidate.default) {
+                const defaultCandidate = normalize(candidate.default);
+                if (defaultCandidate) return defaultCandidate;
+            }
+            if (candidate.type && typeof candidate.type === "function") {
+                return candidate;
+            }
+            if (typeof candidate === "function" && candidate.prototype?.render) {
+                return { type: candidate, direct: true };
+            }
+            return null;
+        };
+
+        const source = candidate => {
+            const normalized = normalize(candidate);
+            if (!normalized) return "";
+            try {
+                return String(normalized.type);
+            } catch (err) {
+                return "";
+            }
+        };
+
+        const isCandidate = candidate => {
+            const normalized = normalize(candidate);
+            if (!normalized) return false;
+            const text = source(normalized);
+            if (!text) return false;
+            return text.includes("burstReactionsEnabled") ||
+                (/reaction/i.test(text) && /(emoji|tooltip|popout|count)/i.test(text));
+        };
+
+        const queries = [
+            () => Webpack.getModule(candidate => isCandidate(candidate), { searchExports: true }),
+            () => typeof Filters.byStrings === "function"
+                ? Webpack.getModule(Filters.byStrings("burstReactionsEnabled"), { searchExports: true })
+                : null,
+            () => typeof Filters.byStrings === "function"
+                ? Webpack.getModule(Filters.byStrings("burstReactions"), { searchExports: true })
+                : null,
+            () => typeof Filters.byStrings === "function"
+                ? Webpack.getModule(Filters.byStrings("reaction", "emoji"), { searchExports: true })
+                : null
+        ];
+
+        for (const query of queries) {
+            try {
+                const candidate = normalize(query());
+                if (isCandidate(candidate)) return candidate;
+            } catch (err) {
+                // Discord's module shape changes between builds; try the next resolver.
+            }
+        }
+
+        return null;
+    }
+
     _patchReaction() {
         const connectedReaction = this.modules.ConnectedReaction;
         const patcher = BdApi.Patcher;
         if (!connectedReaction || !patcher || typeof patcher.after !== "function") return false;
 
-        let reactionRenderPatched = false;
-        const unpatchConnectedReaction = patcher.after(
-            this.name,
-            connectedReaction,
-            "type",
-            (_, __, reaction) => {
-                const render = reaction?.type?.prototype?.render;
-                if (typeof render !== "function" || reactionRenderPatched) return reaction;
-
-                reactionRenderPatched = true;
+        const patchRenderTarget = target => {
+            if (!target || typeof target.render !== "function") return false;
+            try {
                 const unpatchRender = patcher.after(
                     this.name,
-                    reaction.type.prototype,
+                    target,
                     "render",
                     (thisObject, __, result) => this._appendReactors(thisObject, result)
                 );
                 if (typeof unpatchRender === "function") this.unpatches.push(unpatchRender);
-
-                try {
-                    unpatchConnectedReaction();
-                } catch (err) {
-                    this._log("Failed to remove bootstrap patch:", err);
-                }
-                return reaction;
+                return true;
+            } catch (err) {
+                this._log("Failed to patch reaction render:", err);
+                return false;
             }
-        );
+        };
+
+        const directTarget = connectedReaction.type?.prototype?.render
+            ? connectedReaction.type.prototype
+            : null;
+        if (connectedReaction.direct || directTarget) {
+            return Boolean(patchRenderTarget(directTarget || connectedReaction.type.prototype));
+        }
+
+        let reactionRenderPatched = false;
+        let unpatchConnectedReaction;
+        try {
+            unpatchConnectedReaction = patcher.after(
+                this.name,
+                connectedReaction,
+                "type",
+                (_, __, reaction) => {
+                    const target = reaction?.type?.prototype?.render
+                        ? reaction.type.prototype
+                        : reaction?.prototype?.render
+                            ? reaction.prototype
+                            : null;
+                    if (!target || reactionRenderPatched) return reaction;
+
+                    if (!patchRenderTarget(target)) return reaction;
+                    reactionRenderPatched = true;
+
+                    try {
+                        unpatchConnectedReaction();
+                    } catch (err) {
+                        this._log("Failed to remove bootstrap patch:", err);
+                    }
+                    return reaction;
+                }
+            );
+        } catch (err) {
+            this._log("Failed to patch connected reaction:", err);
+            return false;
+        }
 
         if (typeof unpatchConnectedReaction === "function") {
             this.unpatches.push(unpatchConnectedReaction);
@@ -253,6 +379,7 @@ module.exports = class WhoReacted {
     }
 
     _subscribeReactionStore() {
+        if (this.reactionStoreUnsubscribe) return;
         const store = this.modules.ReactionStore;
         const add = store && (store.addChangeListener || store.addReactChangeListener);
         const remove = store && (store.removeChangeListener || store.removeReactChangeListener);

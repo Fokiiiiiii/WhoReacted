@@ -38,10 +38,15 @@ module.exports = class WhoReacted {
         this.unpatchFns = [];
         this.observer = null;
         this.domRoots = new Map(); // element -> {root, container}
+        this.scanFrameId = null;
+        this.pendingScanRoots = new Set();
+        this.pendingCleanupRoots = new Set();
         this.pillRetryFrames = new Map(); // element -> requestAnimationFrame id
+        this.maxPillRetries = 2;
         this.reactionUsersCache = new Map(); // reaction key -> {users, timestamp}
-        this.reactionUsersCacheTtl = 5 * 60 * 1000;
-        this.reactionUsersCacheMax = 500;
+        this.reactionUsersCacheTtl = 60 * 1000;
+        this.reactionUsersCacheMax = 100;
+        this.reactionUsersCacheUserMax = 12;
 
         this.started = false;
 
@@ -143,6 +148,12 @@ module.exports = class WhoReacted {
         }
 
         try {
+            if (this.scanFrameId !== null) {
+                cancelAnimationFrame(this.scanFrameId);
+                this.scanFrameId = null;
+            }
+            this.pendingScanRoots.clear();
+            this.pendingCleanupRoots.clear();
             for (const [, entry] of this.domRoots) {
                 this._teardownDomEntry(entry);
             }
@@ -730,6 +741,28 @@ module.exports = class WhoReacted {
         return [];
     }
 
+    _exceedsReactionThresholds(message) {
+        const settings = this.settings || this.defaults;
+        const reactions = this._reactionsArray(message);
+
+        if (settings.emojiThreshold && reactions.length > settings.emojiThreshold) {
+            return true;
+        }
+
+        if (settings.reactionsTotalThreshold) {
+            const total = reactions.reduce((sum, reaction) => sum + (reaction && reaction.count ? reaction.count : 0), 0);
+            if (total > settings.reactionsTotalThreshold) return true;
+        }
+
+        if (settings.reactionsPerEmojiThreshold) {
+            for (const reaction of reactions) {
+                if (reaction && reaction.count > settings.reactionsPerEmojiThreshold) return true;
+            }
+        }
+
+        return false;
+    }
+
     _effectiveReactionCount(message, emoji, type, suppliedCount, knownUsersCount) {
         const direct = Number(suppliedCount);
         if (Number.isFinite(direct) && direct > 0) return direct;
@@ -759,7 +792,11 @@ module.exports = class WhoReacted {
     _cacheReactionUsers(key, users) {
         if (!key || !Array.isArray(users) || users.length === 0) return;
         this.reactionUsersCache.delete(key);
-        this.reactionUsersCache.set(key, { users: users.slice(), timestamp: Date.now() });
+        const userLimit = Math.max(1, Math.min(
+            this.reactionUsersCacheUserMax,
+            Number(this.settings?.max) || this.defaults.max
+        ));
+        this.reactionUsersCache.set(key, { users: users.slice(0, userLimit), timestamp: Date.now() });
         while (this.reactionUsersCache.size > this.reactionUsersCacheMax) {
             this.reactionUsersCache.delete(this.reactionUsersCache.keys().next().value);
         }
@@ -809,6 +846,7 @@ module.exports = class WhoReacted {
         } catch (err) { /* ignore */ }
 
         const messageId = message ? message.id : null;
+        const hideByThreshold = self._exceedsReactionThresholds(message);
 
         const channel = useStateFromStores(
             [ChannelStore],
@@ -821,7 +859,7 @@ module.exports = class WhoReacted {
         const rawUsers = useStateFromStores(
             [ReactionStore],
             () => {
-                if (!channelId || !messageId || !emoji) return [];
+                if (hideByThreshold || !channelId || !messageId || !emoji) return [];
                 let reactions = {};
                 try {
                     // Historical signature: (channelId, messageId, emoji, limit, type)
@@ -849,7 +887,7 @@ module.exports = class WhoReacted {
                 self._saveDiag(false);
                 return list;
             },
-            [channelId, messageId, emoji && emoji.name, emoji && emoji.id, type]
+            [hideByThreshold, channelId, messageId, emoji && emoji.name, emoji && emoji.id, type]
         );
 
         // Keep the last confirmed result beyond a single React root's
@@ -870,32 +908,7 @@ module.exports = class WhoReacted {
 
         // ---- all hooks are done; conditions may return early from here ----
 
-        function isThresholdDisabled(threshold) {
-            return threshold === 0 || threshold == null;
-        }
-
-        function shouldHide() {
-            try {
-                const reactions = self._reactionsArray(message);
-                if (!isThresholdDisabled(settings.emojiThreshold) && reactions.length > settings.emojiThreshold) {
-                    return true;
-                }
-                if (!isThresholdDisabled(settings.reactionsTotalThreshold)) {
-                    const total = reactions.reduce((sum, r) => sum + (r && r.count ? r.count : 0), 0);
-                    if (total > settings.reactionsTotalThreshold) return true;
-                }
-                if (!isThresholdDisabled(settings.reactionsPerEmojiThreshold)) {
-                    for (const r of reactions) {
-                        if (r && r.count > settings.reactionsPerEmojiThreshold) return true;
-                    }
-                }
-            } catch (err) {
-                self._logError("Error evaluating hide thresholds:", err);
-            }
-            return false;
-        }
-
-        if (!message || !emoji || shouldHide()) {
+        if (!message || !emoji || hideByThreshold) {
             return null;
         }
 
@@ -950,19 +963,74 @@ module.exports = class WhoReacted {
         this.observer = new MutationObserver(this._onMutations);
         this.observer.observe(root, { childList: true, subtree: true });
 
-        // Initial sweep of anything already on screen.
-        this._scanForPills(root);
+        // Initial sweep is queued so startup mutations are coalesced into one pass.
+        this._queueScanRoot(root);
+    }
+
+    _queueScanRoot(root) {
+        if (typeof Node === "undefined" || !(root instanceof Node)) return;
+
+        for (const queuedRoot of this.pendingScanRoots) {
+            if (queuedRoot === root || (queuedRoot.contains && queuedRoot.contains(root))) return;
+            if (root.contains && root.contains(queuedRoot)) {
+                this.pendingScanRoots.delete(queuedRoot);
+            }
+        }
+
+        this.pendingScanRoots.add(root);
+        this._scheduleScan();
+    }
+
+    _queueCleanupRoot(root) {
+        if (typeof Node === "undefined" || !(root instanceof Node)) return;
+
+        for (const queuedRoot of this.pendingCleanupRoots) {
+            if (queuedRoot === root || (queuedRoot.contains && queuedRoot.contains(root))) return;
+            if (root.contains && root.contains(queuedRoot)) {
+                this.pendingCleanupRoots.delete(queuedRoot);
+            }
+        }
+
+        this.pendingCleanupRoots.add(root);
+        this._scheduleScan();
+    }
+
+    _scheduleScan() {
+        if (this.scanFrameId !== null) return;
+
+        this.scanFrameId = requestAnimationFrame(() => {
+            this.scanFrameId = null;
+            const roots = Array.from(this.pendingScanRoots);
+            const cleanupRoots = Array.from(this.pendingCleanupRoots);
+            this.pendingScanRoots.clear();
+            this.pendingCleanupRoots.clear();
+
+            for (const root of cleanupRoots) {
+                if (!root.isConnected) this._cleanupRemovedPills(root);
+            }
+            this._pruneDomRoots();
+
+            for (const root of roots) {
+                if (root.isConnected) this._scanForPills(root);
+            }
+        });
+    }
+
+    _pruneDomRoots() {
+        for (const [pillEl, entry] of Array.from(this.domRoots.entries())) {
+            if (pillEl.isConnected && entry.container && entry.container.isConnected) continue;
+            this._teardownDomEntry(entry);
+            this.domRoots.delete(pillEl);
+        }
     }
 
     _onMutations(mutations) {
         for (const mutation of mutations) {
             for (const node of mutation.addedNodes) {
-                if (!(node instanceof HTMLElement)) continue;
-                this._scanForPills(node);
+                if (node instanceof HTMLElement) this._queueScanRoot(node);
             }
             for (const node of mutation.removedNodes) {
-                if (!(node instanceof HTMLElement)) continue;
-                this._cleanupRemovedPills(node);
+                if (node instanceof HTMLElement) this._queueCleanupRoot(node);
             }
         }
     }
@@ -1010,7 +1078,7 @@ module.exports = class WhoReacted {
     }
 
     _schedulePillRetry(pillEl, attempt) {
-        if (!this.started || !pillEl || !pillEl.isConnected || attempt > 8) return;
+        if (!this.started || !pillEl || !pillEl.isConnected || attempt > this.maxPillRetries) return;
         if (this.pillRetryFrames.has(pillEl)) return;
         const frameId = requestAnimationFrame(() => {
             this.pillRetryFrames.delete(pillEl);
@@ -1042,10 +1110,7 @@ module.exports = class WhoReacted {
     _injectIntoPill(pillEl, retryAttempt = 0) {
         if (!pillEl) return;
 
-        if (retryAttempt === 0 && this.pillRetryFrames.has(pillEl)) {
-            cancelAnimationFrame(this.pillRetryFrames.get(pillEl));
-            this.pillRetryFrames.delete(pillEl);
-        }
+        if (retryAttempt === 0 && this.pillRetryFrames.has(pillEl)) return;
 
         if (retryAttempt === 0) this.diag.strategyB.pillsSeen++;
 
@@ -1080,6 +1145,15 @@ module.exports = class WhoReacted {
         } catch (err) { /* keep null */ }
         const reactionKey = this._reactionKey(channelId, props.message.id, props.emoji, props.type);
         const existing = this.domRoots.get(pillEl);
+
+        if (this._exceedsReactionThresholds(props.message)) {
+            if (existing) {
+                this._teardownDomEntry(existing);
+                this.domRoots.delete(pillEl);
+            }
+            return;
+        }
+
         if (existing && existing.reactionKey === reactionKey) return;
         if (existing) {
             this._teardownDomEntry(existing);

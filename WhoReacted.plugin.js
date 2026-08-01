@@ -3,12 +3,18 @@
  * @author Fokiiiiiii (modernized rewrite), jaimeadf (original)
  * @authorId 0
  * @description Shows the avatars of the users who reacted next to each reaction pill on messages. Modernized rewrite of the original WhoReacted plugin (webpack+JSX build) to work with current Discord using resilient module discovery and DOM/MutationObserver injection, in a self-contained plain-JS build (no bundler, no ZeresPluginLibrary).
- * @version 1.0.3
+ * @version 1.0.4
  * @authorLink https://github.com/Fokiiiiiii
  * @source https://github.com/Fokiiiiiii/WhoReacted
  * @website https://github.com/Fokiiiiiii/WhoReacted
  * @updateUrl https://raw.githubusercontent.com/Fokiiiiiii/WhoReacted/main/WhoReacted.plugin.js
  */
+
+const UPDATE_URL = "https://raw.githubusercontent.com/Fokiiiiiii/WhoReacted/main/WhoReacted.plugin.js";
+const UPDATE_FALLBACK_URL = "https://cdn.jsdelivr.net/gh/Fokiiiiiii/WhoReacted@main/WhoReacted.plugin.js";
+const UPDATE_CHECK_DELAY = 15 * 1000;
+const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000;
+const UPDATE_FETCH_TIMEOUT = 8 * 1000;
 
 module.exports = class WhoReacted {
     constructor(meta) {
@@ -47,6 +53,13 @@ module.exports = class WhoReacted {
         this.reactionUsersCacheTtl = 60 * 1000;
         this.reactionUsersCacheMax = 100;
         this.reactionUsersCacheUserMax = 12;
+
+        this.updateCheckTimer = null;
+        this.updateCheckInFlight = false;
+        this.updateAbortController = null;
+        this.updateNoticeClose = null;
+        this.updateNoticeVersion = null;
+        this.updateGeneration = 0;
 
         this.started = false;
 
@@ -124,6 +137,7 @@ module.exports = class WhoReacted {
             this.diag.strategy = this.strategy;
             this._logStartupSummary();
             this._saveDiag(true);
+            this._scheduleUpdateCheck();
         } catch (err) {
             this._logError("Unexpected error during start():", err);
             BdApi.UI.showToast(`${this.name}: failed to start (${err && err.message ? err.message : err})`, { type: "error" });
@@ -171,6 +185,21 @@ module.exports = class WhoReacted {
         } catch (err) {
             this._logError("Error removing style:", err);
         }
+
+        if (this.updateCheckTimer !== null) {
+            clearTimeout(this.updateCheckTimer);
+            this.updateCheckTimer = null;
+        }
+        if (this.updateAbortController) {
+            try { this.updateAbortController.abort(); } catch (err) { /* ignore */ }
+            this.updateAbortController = null;
+        }
+        if (typeof this.updateNoticeClose === "function") {
+            try { this.updateNoticeClose(true); } catch (err) { /* ignore */ }
+            this.updateNoticeClose = null;
+        }
+        this.updateCheckInFlight = false;
+        this.updateGeneration++;
 
         if (this._diagSaveTimer) {
             clearTimeout(this._diagSaveTimer);
@@ -239,6 +268,241 @@ module.exports = class WhoReacted {
         } catch (err) {
             this._logError("Failed to save settings:", err);
         }
+    }
+
+    _scheduleUpdateCheck(delay = UPDATE_CHECK_DELAY) {
+        if (!this.started) return;
+
+        if (this.updateCheckTimer !== null) {
+            clearTimeout(this.updateCheckTimer);
+        }
+
+        this.updateCheckTimer = setTimeout(() => {
+            this.updateCheckTimer = null;
+            this._checkForUpdate(true)
+                .catch(() => {})
+                .finally(() => {
+                    if (this.started) this._scheduleUpdateCheck(UPDATE_CHECK_INTERVAL);
+                });
+        }, delay);
+    }
+
+    _getUpdateUrls() {
+        const configuredUrl = typeof this.meta.updateUrl === "string" && /^https:\/\//.test(this.meta.updateUrl)
+            ? this.meta.updateUrl
+            : UPDATE_URL;
+
+        return [...new Set([configuredUrl, UPDATE_URL, UPDATE_FALLBACK_URL])];
+    }
+
+    _parseUpdateMetadata(source) {
+        if (typeof source !== "string" || source.length < 100 || source.length > 2 * 1024 * 1024) {
+            throw new Error("Update payload has an invalid size.");
+        }
+
+        const nameMatch = source.match(/^\s*\*\s*@name\s+(.+)$/m);
+        const versionMatch = source.match(/^\s*\*\s*@version\s+([^\s*]+)$/m);
+        const name = nameMatch && nameMatch[1] ? nameMatch[1].trim() : "";
+        const version = versionMatch && versionMatch[1] ? versionMatch[1].trim() : "";
+
+        if (name !== this.name) {
+            throw new Error("Update payload belongs to a different plugin.");
+        }
+        if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+            throw new Error("Update payload has an invalid version.");
+        }
+        if (!/module\.exports\s*=\s*class\s+WhoReacted\b/.test(source)) {
+            throw new Error("Update payload is not a valid WhoReacted plugin.");
+        }
+
+        return {name, version, source};
+    }
+
+    _compareVersions(leftValue, rightValue) {
+        const parse = value => {
+            const match = String(value || "").trim().replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
+            if (!match) return null;
+            return {
+                parts: [Number(match[1]), Number(match[2]), Number(match[3])],
+                pre: match[4] ? match[4].split(".") : []
+            };
+        };
+
+        const left = parse(leftValue);
+        const right = parse(rightValue);
+        if (!left || !right) return String(leftValue).localeCompare(String(rightValue), undefined, {numeric: true});
+
+        for (let i = 0; i < left.parts.length; i++) {
+            if (left.parts[i] !== right.parts[i]) return left.parts[i] > right.parts[i] ? 1 : -1;
+        }
+        if (!left.pre.length && !right.pre.length) return 0;
+        if (!left.pre.length) return 1;
+        if (!right.pre.length) return -1;
+
+        const length = Math.max(left.pre.length, right.pre.length);
+        for (let i = 0; i < length; i++) {
+            if (left.pre[i] === undefined) return -1;
+            if (right.pre[i] === undefined) return 1;
+
+            const leftNumber = /^\d+$/.test(left.pre[i]);
+            const rightNumber = /^\d+$/.test(right.pre[i]);
+            if (leftNumber && rightNumber) {
+                const result = Number(left.pre[i]) - Number(right.pre[i]);
+                if (result) return result > 0 ? 1 : -1;
+            }
+            else if (leftNumber !== rightNumber) {
+                return leftNumber ? -1 : 1;
+            }
+            else if (left.pre[i] !== right.pre[i]) {
+                return left.pre[i] > right.pre[i] ? 1 : -1;
+            }
+        }
+        return 0;
+    }
+
+    async _fetchUpdate(url, controller) {
+        const request = typeof BdApi !== "undefined" && BdApi.Net && typeof BdApi.Net.fetch === "function"
+            ? BdApi.Net.fetch.bind(BdApi.Net)
+            : (typeof fetch === "function" ? fetch : null);
+        if (!request) throw new Error("No supported network API is available.");
+
+        const separator = url.includes("?") ? "&" : "?";
+        const requestUrl = url + separator + "whoreacted_update=" + Date.now();
+        const options = {
+            cache: "no-store",
+            headers: {
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache"
+            },
+            timeout: UPDATE_FETCH_TIMEOUT
+        };
+        if (controller) options.signal = controller.signal;
+
+        const response = await request(requestUrl, options);
+        if (!response || !response.ok) {
+            throw new Error("Update request failed with HTTP " + (response && response.status ? response.status : "unknown") + ".");
+        }
+
+        const source = await response.text();
+        return this._parseUpdateMetadata(source);
+    }
+
+    async _checkForUpdate(notify = true) {
+        if (!this.started || this.updateCheckInFlight) return null;
+
+        const generation = this.updateGeneration;
+        const controller = typeof AbortController === "function" ? new AbortController() : null;
+        this.updateCheckInFlight = true;
+        this.updateAbortController = controller;
+
+        try {
+            for (const url of this._getUpdateUrls()) {
+                if (!this.started || generation !== this.updateGeneration) return null;
+
+                try {
+                    const update = await this._fetchUpdate(url, controller);
+                    if (!this.started || generation !== this.updateGeneration) return null;
+                    if (this._compareVersions(update.version, this.meta.version) <= 0) {
+                        this.updateNoticeVersion = null;
+                        return null;
+                    }
+
+                    if (notify && this.updateNoticeVersion !== update.version) {
+                        this._showUpdateNotice(update);
+                    }
+                    return update;
+                }
+                catch (err) {
+                    if (controller && controller.signal.aborted) return null;
+                }
+            }
+            return null;
+        }
+        finally {
+            if (this.updateAbortController === controller) {
+                this.updateAbortController = null;
+                this.updateCheckInFlight = false;
+            }
+        }
+    }
+
+    _showUpdateNotice(update) {
+        this.updateNoticeVersion = update.version;
+        if (typeof BdApi === "undefined" || !BdApi.UI || typeof BdApi.UI.showNotice !== "function") return;
+
+        let closeNotice = null;
+        const close = immediate => {
+            if (typeof closeNotice === "function") closeNotice(immediate);
+            if (this.updateNoticeClose === closeNotice) this.updateNoticeClose = null;
+        };
+        const install = async () => {
+            close(true);
+            try {
+                await this._installUpdate(update);
+            }
+            catch (err) {
+                this.updateNoticeVersion = null;
+                this._logError("Automatic update failed:", err);
+                BdApi.UI.showToast(this.name + ": update failed. See console for details.", {type: "error", forceShow: true});
+            }
+        };
+
+        closeNotice = BdApi.UI.showNotice(
+            this.name + " " + update.version + " is available.",
+            {
+                type: "info",
+                timeout: 0,
+                buttons: [
+                    {label: "Update", onClick: install},
+                    {label: "Later", onClick: () => close(true)}
+                ]
+            }
+        );
+        this.updateNoticeClose = closeNotice;
+    }
+
+    async _installUpdate(update) {
+        if (typeof require !== "function" || typeof BdApi === "undefined" || !BdApi.Plugins) {
+            throw new Error("BetterDiscord plugin APIs are unavailable.");
+        }
+
+        const fs = require("fs");
+        const path = require("path");
+        const folder = BdApi.Plugins.folder;
+        const addon = typeof BdApi.Plugins.get === "function" ? BdApi.Plugins.get(this.name) : null;
+        const filename = addon && addon.filename;
+
+        if (typeof folder !== "string" || typeof filename !== "string" || !filename.endsWith(".plugin.js")) {
+            throw new Error("Could not resolve the installed plugin path.");
+        }
+
+        const root = path.resolve(folder);
+        const target = path.resolve(root, filename);
+        if (target !== root && !target.startsWith(root + path.sep)) {
+            throw new Error("Resolved plugin path is outside the BetterDiscord plugins folder.");
+        }
+
+        const temporary = target + ".whoreacted-update-" + Date.now() + ".tmp";
+        fs.writeFileSync(temporary, update.source, "utf8");
+        try {
+            try {
+                fs.renameSync(temporary, target);
+            }
+            catch (renameError) {
+                fs.writeFileSync(target, update.source, "utf8");
+                try { fs.unlinkSync(temporary); } catch (cleanupError) { /* ignore */ }
+            }
+        }
+        catch (writeError) {
+            try { fs.unlinkSync(temporary); } catch (cleanupError) { /* ignore */ }
+            throw writeError;
+        }
+
+        const reloadResult = BdApi.Plugins.reload(this.name);
+        if (reloadResult === false) {
+            throw new Error("BetterDiscord could not reload the updated plugin.");
+        }
+        BdApi.UI.showToast(this.name + " updated to " + update.version + ".", {type: "success", forceShow: true});
     }
 
     updateSetting(name, value) {

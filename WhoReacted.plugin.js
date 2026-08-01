@@ -201,17 +201,29 @@ module.exports = class WhoReacted {
 
     _findConnectedReaction(Webpack, Filters) {
         const normalize = candidate => {
-            if (!candidate) return null;
-            if (candidate.default) {
-                const defaultCandidate = normalize(candidate.default);
-                if (defaultCandidate) return defaultCandidate;
+            let current = candidate;
+            const visited = new Set();
+
+            for (let depth = 0; current && depth < 8; depth++) {
+                if ((typeof current === "object" || typeof current === "function") && visited.has(current)) {
+                    return null;
+                }
+                if (typeof current === "object" || typeof current === "function") {
+                    visited.add(current);
+                }
+
+                if (current.type && typeof current.type === "function") {
+                    return current;
+                }
+                if (typeof current === "function" && current.prototype?.render) {
+                    return { type: current, direct: true };
+                }
+                if (!current.default || current.default === current) {
+                    return null;
+                }
+                current = current.default;
             }
-            if (candidate.type && typeof candidate.type === "function") {
-                return candidate;
-            }
-            if (typeof candidate === "function" && candidate.prototype?.render) {
-                return { type: candidate, direct: true };
-            }
+
             return null;
         };
 

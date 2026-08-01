@@ -1,9 +1,10 @@
 /**
  * @name WhoReacted
- * @author jaimeadf (original), Fokiiiiiii
+ * @author Fokiiiiiii (modernized rewrite), jaimeadf (original)
  * @authorId 0
- * @description Shows the avatars of users who reacted to a message.
+ * @description Shows the avatars of the users who reacted next to each reaction pill on messages. Modernized rewrite of the original WhoReacted plugin (webpack+JSX build) to work with current Discord using resilient module discovery and DOM/MutationObserver injection, in a self-contained plain-JS build (no bundler, no ZeresPluginLibrary).
  * @version 1.0.4
+ * @authorLink https://github.com/Fokiiiiiii
  * @source https://github.com/Fokiiiiiii/WhoReacted
  * @website https://github.com/Fokiiiiiii/WhoReacted
  * @updateUrl https://raw.githubusercontent.com/Fokiiiiiii/WhoReacted/main/WhoReacted.plugin.js
@@ -14,9 +15,12 @@ module.exports = class WhoReacted {
         this.meta = meta || {};
         this.name = "WhoReacted";
 
+        // ---- runtime state ----
+        this.mods = {};
+        this.settings = null;
         this.defaults = {
             max: 6,
-            avatarSize: 24,
+            avatarSize: 20,
             avatarOverlap: 100 / 3,
             avatarSpacing: 100 / 12,
             emojiThreshold: 10,
@@ -26,476 +30,1026 @@ module.exports = class WhoReacted {
             hideBots: false,
             hideBlocked: false
         };
-        this.settings = Object.assign({}, this.defaults);
-        this.settingsListeners = new Set();
-        this.modules = {};
-        this.unpatches = [];
-        this.started = false;
-        this.moduleRetryTimer = null;
-        this.moduleRetryAttempts = 0;
-        this.moduleRetryLimit = 10;
 
-        this.reactionRevision = 0;
-        this.reactionCache = new Map();
-        this.reactionCacheTtl = 60 * 1000;
-        this.reactionStoreUnsubscribe = null;
+        this.listeners = new Set();
         this.maskIdCounter = 0;
 
-        this.ReactorC = props => this._Reactor(props);
-        this.MaskedReactorC = props => this._MaskedReactor(props);
-        this.ReactorsC = props => this._Reactors(props);
-        this.SmartReactorsC = props => this._SmartReactors(props);
+        this.strategy = null; // always "B" (DOM/MutationObserver injection)
+        this.observer = null;
+        this.domRoots = new Map(); // element -> {root, container}
+        this.scanFrameId = null;
+        this.pendingScanRoots = new Set();
+        this.pendingCleanupRoots = new Set();
+        this.pillRetryFrames = new Map(); // element -> requestAnimationFrame id
+        this.maxPillRetries = 2;
+        this.reactionUsersCache = new Map(); // reaction key -> {users, timestamp}
+        this.reactionUsersCacheTtl = 60 * 1000;
+        this.reactionUsersCacheMax = 100;
+        this.reactionUsersCacheUserMax = 12;
+
+        this.started = false;
+
+        // On-disk diagnostics. Persisted (throttled) to
+        // plugins/WhoReacted.config.json under the "diagnostics" key so it
+        // can be inspected from the filesystem without console access.
+        this.diag = {
+            pluginVersion: this.meta.version || null,
+            bdVersion: null,
+            updates: 0,
+            lastUpdate: null,
+            strategy: null,
+            fallbacksUsed: [],
+            strategyB: {
+                pillsSeen: 0,
+                fiberPropsFound: 0,
+                fiberPropsMissing: 0,
+                rendersOk: 0,
+                renderErrors: 0,
+                sampleFiberPropKeys: null
+            },
+            data: {
+                getReactionsCalls: 0,
+                lastReactionsCount: -1,
+                reactionCacheHits: 0,
+                reactionCacheEntries: 0,
+                lastEffectiveCount: 0,
+                invalidUsersSkipped: 0
+            },
+            errors: []
+        };
+        this._lastDiagSave = 0;
+        this._diagSaveTimer = null;
+
+        // Bind so they can be used as stable references for patches/listeners.
+        this._onMutations = this._onMutations.bind(this);
+
+        // Stable component references, created ONCE so React sees the same
+        // component identity across renders (no remounting) and so hooks run
+        // inside real component boundaries — these must NEVER be invoked as
+        // plain function calls, always via createElement.
+        this.ReactorC = (props) => this._Reactor(props);
+        this.MaskedReactorC = (props) => this._MaskedReactor(props);
+        this.ReactorsC = (props) => this._Reactors(props);
+        this.RootC = (props) => this._WhoReactedReactors(props);
     }
+
+    /* ------------------------------------------------------------------ *
+     *  Lifecycle
+     * ------------------------------------------------------------------ */
 
     start() {
-        this.moduleRetryAttempts = 0;
-        this._loadSettings();
-        this._injectStyles();
-        this.started = true;
-        this._startWhenModulesReady();
-    }
+        if (this.started) return;
 
-    _startWhenModulesReady() {
-        if (!this.started) return;
+        const showFailure = (message) => {
+            try {
+                if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.showToast === "function") {
+                    BdApi.UI.showToast(message, { type: "error" });
+                }
+            } catch (err) {
+                this._logError("Failed to show startup error:", err);
+            }
+        };
 
-        if (!this._resolveModules()) {
-            this._scheduleModuleRetry();
-            return;
+        try {
+            this._loadSettings();
+            this._injectStyles();
+
+            if (!this._resolveModules()) {
+                this._removeStyles();
+                this._logError("Aborting start(): one or more critical modules could not be resolved.");
+                showFailure("WhoReacted: failed to initialize (missing modules). See console for details.");
+                return;
+            }
+
+            this.started = true;
+            this.strategy = "B";
+
+            if (!this._startStrategyB()) {
+                this.started = false;
+                this.strategy = null;
+                this._removeStyles();
+                this._logError("Aborting start(): DOM/Fiber injection could not be initialized.");
+                showFailure("WhoReacted: failed to initialize the reaction view.");
+                return;
+            }
+
+            try {
+                this.diag.bdVersion = (typeof BdApi !== "undefined" && BdApi.version) || null;
+                this.diag.strategy = this.strategy;
+                this._logStartupSummary();
+                this._saveDiag(true);
+            } catch (err) {
+                this._logError("Failed to record startup diagnostics:", err);
+            }
+        } catch (err) {
+            this.started = false;
+            this._logError("Unexpected error during start():", err);
+            this._removeStyles();
+            showFailure(`WhoReacted: failed to start (${err && err.message ? err.message : err})`);
         }
-
-        this.moduleRetryAttempts = 0;
-        this._subscribeReactionStore();
-
-        if (!this._patchReaction()) {
-            this._scheduleModuleRetry();
-        }
-    }
-
-    _scheduleModuleRetry() {
-        if (!this.started || this.moduleRetryTimer) return;
-
-        if (this.moduleRetryAttempts >= this.moduleRetryLimit) {
-            this._failStart("WhoReacted: Discordのリアクションモジュールを取得できませんでした。");
-            return;
-        }
-
-        this.moduleRetryAttempts++;
-        this.moduleRetryTimer = setTimeout(() => {
-            this.moduleRetryTimer = null;
-            this._startWhenModulesReady();
-        }, 500);
-    }
-
-    _failStart(message) {
-        this.started = false;
-        this._unsubscribeReactionStore();
-        this._removeStyles();
-        this._showToast(message, "error");
     }
 
     stop() {
-        if (this.moduleRetryTimer) {
-            clearTimeout(this.moduleRetryTimer);
-            this.moduleRetryTimer = null;
-        }
-        this.moduleRetryAttempts = 0;
+        this.started = false;
 
         try {
-            if (typeof BdApi !== "undefined" && BdApi.Patcher) {
+            if (typeof BdApi !== "undefined" && BdApi.Patcher && typeof BdApi.Patcher.unpatchAll === "function") {
                 BdApi.Patcher.unpatchAll(this.name);
             }
         } catch (err) {
-            this._log("Failed to unpatch WhoReacted:", err);
+            this._logError("Error while unpatching:", err);
         }
 
-        for (const unpatch of this.unpatches.splice(0)) {
+        try {
+            if (this.observer) this.observer.disconnect();
+        } catch (err) {
+            this._logError("Error disconnecting observer:", err);
+        }
+        this.observer = null;
+        this.observedRoot = null;
+
+        try {
+            if (this.scanFrameId !== null && typeof cancelAnimationFrame === "function") {
+                cancelAnimationFrame(this.scanFrameId);
+            }
+        } catch (err) {
+            this._logError("Error cancelling scan frame:", err);
+        }
+        this.scanFrameId = null;
+        this.pendingScanRoots.clear();
+        this.pendingCleanupRoots.clear();
+
+        for (const [, entry] of Array.from(this.domRoots.entries())) {
+            this._teardownDomEntry(entry);
+        }
+        this.domRoots.clear();
+
+        for (const frameId of this.pillRetryFrames.values()) {
             try {
-                if (typeof unpatch === "function") unpatch();
+                if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(frameId);
             } catch (err) {
-                this._log("Failed to remove a WhoReacted patch:", err);
+                this._logError("Error cancelling pill retry:", err);
             }
         }
+        this.pillRetryFrames.clear();
 
-        this._unsubscribeReactionStore();
-        this.reactionCache.clear();
-        this.started = false;
-        this._removeStyles();
+        try {
+            this._removeStyles();
+        } catch (err) {
+            this._logError("Error removing styles:", err);
+        }
+
+        if (this._diagSaveTimer) {
+            clearTimeout(this._diagSaveTimer);
+            this._diagSaveTimer = null;
+        }
+
+        this.reactionUsersCache.clear();
+        this.mods = {};
+        this.strategy = null;
+        try { this._saveDiag(true); } catch (err) { /* best effort */ }
     }
 
     getSettingsPanel() {
         if (!this.settings) this._loadSettings();
-        if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.buildSettingsPanel === "function") {
-            return this._buildSettingsPanel();
+
+        try {
+            if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.buildSettingsPanel === "function") {
+                return this._buildSettingsPanelViaBdApi();
+            }
+        } catch (err) {
+            this._logError("buildSettingsPanel failed, falling back to manual panel:", err);
         }
-        return this._buildFallbackSettingsPanel();
+
+        try {
+            return this._buildFallbackSettingsPanel();
+        } catch (err) {
+            this._logError("Fallback settings panel failed:", err);
+            return null;
+        }
     }
 
-    _resolveModules() {
-        const Webpack = typeof BdApi !== "undefined" && BdApi.Webpack;
-        const Filters = Webpack && Webpack.Filters;
-        if (!Webpack || !Filters) return false;
+    /* ------------------------------------------------------------------ *
+     *  Settings persistence + pub/sub
+     * ------------------------------------------------------------------ */
 
-        const byKeys = (...keys) => {
+    // Clamps/coerces settings loaded from disk to the ranges the settings
+    // panel actually allows, so a corrupted or hand-edited settings file
+    // can't push out-of-range values into rendering.
+    _normalizeSettings(raw) {
+        const s = Object.assign({}, this.defaults, raw && typeof raw === "object" ? raw : {});
+        const clamp = (value, min, max, fallback) => {
+            const n = Number(value);
+            return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+        };
+        const booleanValue = (value, fallback) => {
+            if (value === true || value === 1 || value === "1" || value === "true") return true;
+            if (value === false || value === 0 || value === "0" || value === "false" || value == null) return false;
+            return fallback;
+        };
+
+        s.max = clamp(s.max, 1, 20, this.defaults.max);
+        s.avatarSize = clamp(s.avatarSize, 8, 48, this.defaults.avatarSize);
+        s.avatarOverlap = clamp(s.avatarOverlap, 0, 100, this.defaults.avatarOverlap);
+        s.avatarSpacing = clamp(s.avatarSpacing, 0, 50, this.defaults.avatarSpacing);
+        s.emojiThreshold = clamp(s.emojiThreshold, 0, 20, this.defaults.emojiThreshold);
+        s.reactionsTotalThreshold = clamp(s.reactionsTotalThreshold, 0, 10000, this.defaults.reactionsTotalThreshold);
+        s.reactionsPerEmojiThreshold = clamp(s.reactionsPerEmojiThreshold, 0, 500, this.defaults.reactionsPerEmojiThreshold);
+        s.hideSelf = booleanValue(s.hideSelf, this.defaults.hideSelf);
+        s.hideBots = booleanValue(s.hideBots, this.defaults.hideBots);
+        s.hideBlocked = booleanValue(s.hideBlocked, this.defaults.hideBlocked);
+
+        return s;
+    }
+
+    _loadSettings() {
+        let saved = null;
+        try {
+            if (typeof BdApi !== "undefined" && BdApi.Data && typeof BdApi.Data.load === "function") {
+                saved = BdApi.Data.load(this.name, "settings");
+            }
+        } catch (err) {
+            this._logError("Failed to load settings:", err);
+        }
+        this.settings = this._normalizeSettings(saved);
+    }
+
+    _saveSettings() {
+        try {
+            if (typeof BdApi !== "undefined" && BdApi.Data && typeof BdApi.Data.save === "function") {
+                BdApi.Data.save(this.name, "settings", this.settings);
+            }
+        } catch (err) {
+            this._logError("Failed to save settings:", err);
+        }
+    }
+
+    updateSetting(name, value) {
+        if (!Object.prototype.hasOwnProperty.call(this.defaults, name)) return;
+        const next = Object.assign({}, this.settings || this.defaults, { [name]: value });
+        this.settings = this._normalizeSettings(next);
+        this._saveSettings();
+        this._notifyListeners();
+    }
+
+    _notifyListeners() {
+        for (const listener of this.listeners) {
+            try { listener(); } catch (err) { this._logError("Settings listener threw:", err); }
+        }
+    }
+
+    subscribe(listener) {
+        this.listeners.add(listener);
+        return () => this.listeners.delete(listener);
+    }
+
+    /* ------------------------------------------------------------------ *
+     *  Diagnostics (persisted to WhoReacted.config.json)
+     * ------------------------------------------------------------------ */
+
+    // Logs to the console AND appends to diag.errors (last 10) so failures
+    // can be inspected from disk without console access.
+    _logError(...parts) {
+        try {
+            BdApi.Logger.error(this.name, ...parts);
+        } catch (e) { /* never throw */ }
+        try {
+            const msg = parts.map(p => {
+                if (p instanceof Error) return p.message || String(p);
+                if (typeof p === "string") return p;
+                try { return JSON.stringify(p); } catch (e) { return String(p); }
+            }).join(" ").slice(0, 400);
+            this.diag.errors.push(msg);
+            if (this.diag.errors.length > 10) {
+                this.diag.errors.splice(0, this.diag.errors.length - 10);
+            }
+            this._saveDiag(false);
+        } catch (e) { /* never throw */ }
+    }
+
+    // Throttled persist: at most one write every 2s; a trailing write is
+    // scheduled so the final state always lands on disk.
+    _saveDiag(force) {
+        try {
+            const now = Date.now();
+            if (!force && now - this._lastDiagSave < 2000) {
+                if (!this._diagSaveTimer) {
+                    this._diagSaveTimer = setTimeout(() => {
+                        this._diagSaveTimer = null;
+                        this._saveDiag(true);
+                    }, 2100);
+                }
+                return;
+            }
+            this._lastDiagSave = now;
+            this.diag.updates++;
+            this.diag.lastUpdate = new Date().toISOString();
+            BdApi.Data.save(this.name, "diagnostics", this.diag);
+        } catch (e) { /* never throw, never recurse into _logError */ }
+    }
+
+    /* ------------------------------------------------------------------ *
+     *  Module resolution
+     * ------------------------------------------------------------------ */
+
+    _resolveModules() {
+        const api = typeof BdApi !== "undefined" ? BdApi : null;
+        const Webpack = api && api.Webpack;
+        const Filters = Webpack && Webpack.Filters;
+
+        if (!Webpack || !Filters || typeof Webpack.getModule !== "function") {
+            this._logError("Discord Webpack API is unavailable.");
+            return false;
+        }
+
+        const fallbacksUsed = [];
+        let criticalMissing = false;
+
+        const getFilterByKeys = keys => {
             try {
                 if (typeof Filters.byKeys === "function") return Filters.byKeys(...keys);
                 if (typeof Filters.byProps === "function") return Filters.byProps(...keys);
             } catch (err) {
-                this._log("Module filter failed:", err);
+                this._logError("Module filter failed:", err);
             }
             return null;
         };
 
-        const getStore = (name, keys) => {
-            let module = null;
+        const resolveStore = (label, storeName, fallbackKeys, critical) => {
+            let mod = null;
+            let via = null;
+
             try {
                 if (typeof Webpack.getStore === "function") {
-                    module = Webpack.getStore(name);
+                    mod = Webpack.getStore(storeName);
+                    if (mod) via = "getStore";
                 }
             } catch (err) {
-                this._log("Store lookup failed:", name, err);
+                this._logError(`getStore("${storeName}") threw:`, err);
             }
 
-            if (!module) {
+            if (!mod) {
                 try {
-                    const filter = byKeys(...keys);
-                    if (filter) module = Webpack.getModule(filter);
+                    const filter = getFilterByKeys(fallbackKeys);
+                    if (filter) {
+                        mod = Webpack.getModule(filter);
+                        if (mod) via = `key fallback (${fallbackKeys.join(",")})`;
+                    }
                 } catch (err) {
-                    this._log("Module lookup failed:", name, err);
+                    this._logError(`Module lookup for ${label} threw:`, err);
                 }
             }
-            return module;
+
+            const valid = mod && fallbackKeys.some(key => typeof mod[key] === "function");
+            if (!valid) {
+                this._logError(`Failed to resolve ${label}.`);
+                if (critical) criticalMissing = true;
+                return null;
+            }
+
+            if (via && via !== "getStore") fallbacksUsed.push(`${label} via ${via}`);
+            return mod;
         };
 
-        this.modules.ReactionStore = getStore("MessageReactionsStore", ["getReactions"]);
-        this.modules.ChannelStore = getStore("ChannelStore", ["getChannel", "hasChannel"]);
-        this.modules.UserStore = getStore("UserStore", ["getUser", "getCurrentUser"]);
-        this.modules.RelationshipStore = getStore("RelationshipStore", ["isBlocked"]);
+        this.mods.ReactionStore = resolveStore("ReactionStore", "MessageReactionsStore", ["getReactions"], true);
+        this.mods.UserStore = resolveStore("UserStore", "UserStore", ["getUser", "getCurrentUser"], true);
+        this.mods.ChannelStore = resolveStore("ChannelStore", "ChannelStore", ["getChannel"], true);
+        this.mods.RelationshipStore = resolveStore("RelationshipStore", "RelationshipStore", ["isBlocked"], false);
 
         try {
-            const useStateFilter = typeof Filters.byStrings === "function"
+            const filter = typeof Filters.byStrings === "function"
                 ? Filters.byStrings("useStateFromStores")
                 : null;
-            this.modules.useStateFromStores = useStateFilter
-                ? Webpack.getModule(useStateFilter, { searchExports: true })
+            const candidate = filter
+                ? Webpack.getModule(filter, { searchExports: true })
                 : null;
+            this.mods.useStateFromStores = typeof candidate === "function"
+                ? candidate
+                : (candidate && typeof candidate.default === "function" ? candidate.default : null);
         } catch (err) {
-            this.modules.useStateFromStores = null;
+            this._logError("Lookup of useStateFromStores threw:", err);
+            this.mods.useStateFromStores = null;
         }
 
-        this.modules.ConnectedReaction = this._findConnectedReaction(Webpack, Filters);
-        this.moduleResolution = {
-            reactionStore: Boolean(this.modules.ReactionStore),
-            channelStore: Boolean(this.modules.ChannelStore),
-            userStore: Boolean(this.modules.UserStore),
-            connectedReaction: Boolean(this.modules.ConnectedReaction)
-        };
+        if (!this.mods.useStateFromStores) {
+            fallbacksUsed.push("useStateFromStores via manual Flux subscription hook");
+            this.mods.useStateFromStores = this._manualUseStateFromStores.bind(this);
+        }
 
-        return Boolean(
-            this.modules.ReactionStore &&
-            this.modules.ChannelStore &&
-            this.modules.UserStore &&
-            this.modules.ConnectedReaction &&
-            typeof this.modules.ConnectedReaction.type === "function"
-        );
+        this._fallbacksUsed = fallbacksUsed;
+        this.diag.fallbacksUsed = fallbacksUsed;
+        return !criticalMissing;
     }
 
-    _findConnectedReaction(Webpack, Filters) {
-        const normalize = candidate => {
-            let current = candidate;
-            const visited = new Set();
-
-            for (let depth = 0; current && depth < 8; depth++) {
-                if ((typeof current === "object" || typeof current === "function") && visited.has(current)) {
-                    return null;
-                }
-                if (typeof current === "object" || typeof current === "function") {
-                    visited.add(current);
-                }
-
-                if (current.type && typeof current.type === "function") {
-                    return current;
-                }
-                if (typeof current === "function" && current.prototype?.render) {
-                    return { type: current, direct: true };
-                }
-                if (!current.default || current.default === current) {
-                    return null;
-                }
-                current = current.default;
-            }
-
-            return null;
-        };
-
-        const source = candidate => {
-            const normalized = normalize(candidate);
-            if (!normalized) return "";
-            try {
-                return String(normalized.type);
-            } catch (err) {
-                return "";
-            }
-        };
-
-        const isCandidate = candidate => {
-            const normalized = normalize(candidate);
-            if (!normalized) return false;
-            const text = source(normalized);
-            if (!text) return false;
-            return text.includes("burstReactionsEnabled") ||
-                (/reaction/i.test(text) && /(emoji|tooltip|popout|count)/i.test(text));
-        };
-
-        const queries = [
-            () => Webpack.getModule(candidate => isCandidate(candidate), { searchExports: true }),
-            () => typeof Filters.byStrings === "function"
-                ? Webpack.getModule(Filters.byStrings("burstReactionsEnabled"), { searchExports: true })
-                : null,
-            () => typeof Filters.byStrings === "function"
-                ? Webpack.getModule(Filters.byStrings("burstReactions"), { searchExports: true })
-                : null,
-            () => typeof Filters.byStrings === "function"
-                ? Webpack.getModule(Filters.byStrings("reaction", "emoji"), { searchExports: true })
-                : null
-        ];
-
-        for (const query of queries) {
-            try {
-                const candidate = normalize(query());
-                if (isCandidate(candidate)) return candidate;
-            } catch (err) {
-                // Discord's module shape changes between builds; try the next resolver.
-            }
-        }
-
-        return null;
-    }
-
-    _patchReaction() {
-        const connectedReaction = this.modules.ConnectedReaction;
-        const patcher = BdApi.Patcher;
-        if (!connectedReaction || !patcher || typeof patcher.after !== "function") return false;
-
-        const patchRenderTarget = target => {
-            if (!target || typeof target.render !== "function") return false;
-            try {
-                const unpatchRender = patcher.after(
-                    this.name,
-                    target,
-                    "render",
-                    (thisObject, __, result) => this._appendReactors(thisObject, result)
-                );
-                if (typeof unpatchRender === "function") this.unpatches.push(unpatchRender);
-                return true;
-            } catch (err) {
-                this._log("Failed to patch reaction render:", err);
-                return false;
-            }
-        };
-
-        const directTarget = connectedReaction.type?.prototype?.render
-            ? connectedReaction.type.prototype
-            : null;
-        if (connectedReaction.direct || directTarget) {
-            return Boolean(patchRenderTarget(directTarget || connectedReaction.type.prototype));
-        }
-
-        let reactionRenderPatched = false;
-        let unpatchConnectedReaction;
-        try {
-            unpatchConnectedReaction = patcher.after(
-                this.name,
-                connectedReaction,
-                "type",
-                (_, __, reaction) => {
-                    const target = reaction?.type?.prototype?.render
-                        ? reaction.type.prototype
-                        : reaction?.prototype?.render
-                            ? reaction.prototype
-                            : null;
-                    if (!target || reactionRenderPatched) return reaction;
-
-                    if (!patchRenderTarget(target)) return reaction;
-                    reactionRenderPatched = true;
-
-                    try {
-                        unpatchConnectedReaction();
-                    } catch (err) {
-                        this._log("Failed to remove bootstrap patch:", err);
-                    }
-                    return reaction;
-                }
-            );
-        } catch (err) {
-            this._log("Failed to patch connected reaction:", err);
-            return false;
-        }
-
-        if (typeof unpatchConnectedReaction === "function") {
-            this.unpatches.push(unpatchConnectedReaction);
-        }
-        return true;
-    }
-
-    _appendReactors(instance, result) {
-        const props = instance?.props;
-        const children = result?.props?.children;
-        const tooltipSlot = Array.isArray(children) ? children[0] : null;
-        const renderTooltip = tooltipSlot?.props?.children;
-
-        if (!props?.message || !props?.emoji || typeof renderTooltip !== "function") {
-            return result;
-        }
-
-        tooltipSlot.props.children = tooltipProps => {
-            const tooltipChildren = renderTooltip(tooltipProps);
-            const tooltipLevel = tooltipChildren?.props?.children;
-            const popoutSlot = tooltipLevel?.props?.children;
-            const renderPopout = popoutSlot?.props?.children;
-
-            if (!tooltipLevel || !popoutSlot || typeof renderPopout !== "function") {
-                return tooltipChildren;
-            }
-
-            popoutSlot.props.children = popoutProps => {
-                const popoutChildren = renderPopout(popoutProps);
-                if (!popoutChildren?.props) return popoutChildren;
-
-                const existingChildren = Array.isArray(popoutChildren.props.children)
-                    ? popoutChildren.props.children.slice()
-                    : [popoutChildren.props.children].filter(Boolean);
-                const key = this._reactionKey(
-                    props.message,
-                    props.emoji,
-                    props.type
-                );
-
-                if (!existingChildren.some(child => child?.key === key)) {
-                    existingChildren.push(this._h(this.SmartReactorsC, {
-                        key,
-                        message: props.message,
-                        emoji: props.emoji,
-                        count: props.count,
-                        type: props.type
-                    }));
-                }
-
-                popoutChildren.props.children = existingChildren;
-                return popoutChildren;
-            };
-
-            return tooltipChildren;
-        };
-
-        return result;
-    }
-
-    _subscribeReactionStore() {
-        if (this.reactionStoreUnsubscribe) return;
-        const store = this.modules.ReactionStore;
-        const add = store && (store.addChangeListener || store.addReactChangeListener);
-        const remove = store && (store.removeChangeListener || store.removeReactChangeListener);
-        if (typeof add !== "function" || typeof remove !== "function") return;
-
-        const listener = () => {
-            this.reactionRevision++;
-            this.reactionCache.clear();
-        };
-
-        try {
-            add.call(store, listener);
-            this.reactionStoreUnsubscribe = () => remove.call(store, listener);
-        } catch (err) {
-            this._log("Failed to subscribe to reactions:", err);
-        }
-    }
-
-    _unsubscribeReactionStore() {
-        if (this.reactionStoreUnsubscribe) {
-            try {
-                this.reactionStoreUnsubscribe();
-            } catch (err) {
-                this._log("Failed to unsubscribe from reactions:", err);
-            }
-        }
-        this.reactionStoreUnsubscribe = null;
-    }
-
-    _useSettings() {
+    _manualUseStateFromStores(stores, getState, deps) {
         const React = BdApi.React;
-        const [settings, setSettings] = React.useState(() => Object.assign({}, this.settings));
-
-        React.useEffect(() => {
-            const listener = () => setSettings(Object.assign({}, this.settings));
-            this.settingsListeners.add(listener);
-            listener();
-            return () => this.settingsListeners.delete(listener);
-        }, []);
-
-        return [
-            settings,
-            this.defaults,
-            (name, value) => this.updateSetting(name, value)
-        ];
-    }
-
-    _useStateFromStores(stores, getState) {
-        const hook = this.modules.useStateFromStores;
-        if (typeof hook === "function") {
-            return hook(stores, getState);
-        }
-        return this._manualUseStateFromStores(stores, getState);
-    }
-
-    _manualUseStateFromStores(stores, getState) {
-        const React = BdApi.React;
-        const [state, setState] = React.useState(getState);
+        const [state, setState] = React.useState(() => {
+            try { return getState(); } catch (err) { return null; }
+        });
 
         React.useEffect(() => {
             let disposed = false;
             const onChange = () => {
-                if (!disposed) setState(getState());
+                if (disposed) return;
+                try {
+                    setState(getState());
+                } catch (err) {
+                    this._logError("Store selector threw:", err);
+                }
             };
 
-            for (const store of stores) {
-                if (store && typeof store.addChangeListener === "function") {
-                    store.addChangeListener(onChange);
+            const cleanups = [];
+            for (const store of Array.isArray(stores) ? stores : []) {
+                if (!store) continue;
+
+                const pairs = [
+                    ["addChangeListener", "removeChangeListener"],
+                    ["addReactChangeListener", "removeReactChangeListener"]
+                ];
+                for (const [addName, removeName] of pairs) {
+                    if (typeof store[addName] !== "function" || typeof store[removeName] !== "function") continue;
+                    try {
+                        store[addName](onChange);
+                        cleanups.push(() => store[removeName](onChange));
+                    } catch (err) {
+                        this._logError(`Failed to subscribe to ${addName}:`, err);
+                    }
+                    break;
                 }
             }
-            onChange();
 
+            onChange();
             return () => {
                 disposed = true;
-                for (const store of stores) {
-                    if (store && typeof store.removeChangeListener === "function") {
-                        store.removeChangeListener(onChange);
-                    }
+                for (const cleanup of cleanups) {
+                    try { cleanup(); } catch (err) { this._logError("Failed to unsubscribe store:", err); }
                 }
             };
-        }, []);
+        }, Array.isArray(deps) ? deps : []);
 
         return state;
     }
 
-    _SmartReactors({ message, emoji, count, type }) {
+    _logStartupSummary() {
+        const fb = this._fallbacksUsed && this._fallbacksUsed.length
+            ? this._fallbacksUsed.join("; ")
+            : "none";
+        BdApi.Logger.info(
+            this.name,
+            `Startup summary — injection strategy: ${this.strategy}; module fallbacks used: ${fb}`
+        );
+    }
+
+    /* ------------------------------------------------------------------ *
+     *  Styles
+     * ------------------------------------------------------------------ */
+
+    _removeStyles() {
+        try {
+            if (typeof BdApi !== "undefined" && BdApi.DOM && typeof BdApi.DOM.removeStyle === "function") {
+                BdApi.DOM.removeStyle(this.name);
+            }
+        } catch (err) {
+            this._logError("Failed to remove styles:", err);
+        }
+    }
+
+    _injectStyles() {
+        const css = `
+.bd-who-reacted__reactors {
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+    line-height: 1;
+}
+
+.bd-who-reacted__reactors:not(:empty) {
+    margin-left: 4px;
+}
+
+.bd-who-reacted__reactors > svg,
+.bd-who-reacted__reactors > img {
+    display: block;
+}
+
+.bd-who-reacted__reactor-avatar {
+    box-sizing: border-box;
+    border-radius: 50%;
+    border: 1.5px solid var(--background-secondary);
+    background-color: #2b2d31;
+    display: block;
+    opacity: 1 !important;
+    object-fit: cover;
+}
+
+.bd-who-reacted__more-reactors {
+    box-sizing: border-box;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    color: #f2f3f5 !important;
+    font-weight: 600;
+    background-color: rgba(63, 65, 71, 0.98);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    opacity: 1 !important;
+    text-shadow: 0 1px 1px rgba(0, 0, 0, 0.45);
+}
+
+.bd-who-reacted__container {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    flex-shrink: 0;
+    margin-left: 4px;
+    padding: 0;
+    border-radius: 0;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+    max-height: 100%;
+    pointer-events: auto;
+    cursor: default;
+}
+
+.bd-who-reacted__pill {
+    display: inline-flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    width: auto !important;
+    max-width: none !important;
+    overflow: visible !important;
+}
+
+
+`;
+        if (typeof BdApi !== "undefined" && BdApi.DOM && typeof BdApi.DOM.addStyle === "function") {
+            BdApi.DOM.addStyle(this.name, css);
+        }
+    }
+
+    /* ------------------------------------------------------------------ *
+     *  React component tree (shared by both injection strategies)
+     * ------------------------------------------------------------------ */
+
+    _h() {
+        return BdApi.React.createElement.apply(BdApi.React, arguments);
+    }
+
+    _avatarSize(size) {
+        const requested = Math.max(16, Number(size) || 20);
+        const powers = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+        return powers.find(value => value >= requested) || 4096;
+    }
+
+    _defaultAvatarUrl(user) {
+        let defaultIndex = 0;
+        try {
+            if (user && user.discriminator && user.discriminator !== "0") {
+                defaultIndex = Number(user.discriminator) % 5;
+            } else if (user && user.id) {
+                defaultIndex = Number((BigInt(user.id) >> 22n) % 6n);
+            }
+        } catch (err) { /* keep index 0 */ }
+        return `https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`;
+    }
+
+    _normalizeAvatarUrl(user, guildId, size) {
+        if (!user) return null;
+        const cdnSize = this._avatarSize(size);
+        let candidate = null;
+
+        try {
+            if (typeof user.getAvatarURL === "function") {
+                candidate = user.getAvatarURL(guildId, cdnSize, true);
+            }
+        } catch (err) { /* try plain-user fallbacks */ }
+
+        try {
+            if (!candidate && typeof user.avatarURL === "function") {
+                candidate = user.avatarURL({ size: cdnSize, extension: "webp" });
+            } else if (!candidate && typeof user.avatarURL === "string") {
+                candidate = user.avatarURL;
+            }
+        } catch (err) { /* try hash fallback */ }
+
+        if (!candidate && user.id && typeof user.avatar === "string" && user.avatar) {
+            const extension = user.avatar.startsWith("a_") ? "gif" : "webp";
+            candidate = `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.${extension}?size=${cdnSize}`;
+        }
+
+        if (!candidate) {
+            candidate = this._defaultAvatarUrl(user);
+        }
+
+        try {
+            const url = String(candidate);
+            if (url.startsWith("//")) return `https:${url}`;
+            if (url.startsWith("/")) return `https://cdn.discordapp.com${url}`;
+            return url;
+        } catch (err) {
+            return null;
+        }
+    }
+
+    _userLabel(user) {
+        if (!user) return "Unknown user";
+        return String(user.globalName || user.global_name || user.displayName || user.username || user.tag || user.id || "Unknown user");
+    }
+
+    _Reactor(props) {
+        const h = this._h.bind(this);
+        const user = props.user;
+        const size = props.size;
+        const guildId = props.guildId;
+
+        const src = this._normalizeAvatarUrl(user, guildId, size);
+        const fallbackSrc = this._defaultAvatarUrl(user);
+        const label = this._userLabel(user);
+
+        return h("img", {
+            className: "bd-who-reacted__reactor-avatar",
+            width: size,
+            height: size,
+            src: src || undefined,
+            title: label,
+            "aria-label": label,
+            alt: "",
+            draggable: false,
+            onError: event => {
+                const img = event.currentTarget;
+                if (img && img.src !== fallbackSrc) img.src = fallbackSrc;
+            }
+        });
+    }
+
+    _useUniqueMaskId() {
         const React = BdApi.React;
-        const [settings] = this._useSettings();
+        if (typeof React.useId === "function") {
+            return "bd-who-reacted-mask-" + String(React.useId()).replace(/[^a-zA-Z0-9_-]/g, "");
+        }
+        const ref = React.useRef(null);
+        if (ref.current === null) {
+            ref.current = "bd-who-reacted-mask-" + (this.maskIdCounter++);
+        }
+        return ref.current;
+    }
 
-        const ReactorsComponent = React.useMemo(() => {
-            let component = this.ReactorsC;
-            if (settings.hideSelf) component = this._withSelfHidden(component);
-            if (settings.hideBots) component = this._withBotsHidden(component);
-            if (settings.hideBlocked) component = this._withBlockedHidden(component);
-            return this._withStoresConnected(component);
-        }, [settings.hideSelf, settings.hideBots, settings.hideBlocked]);
+    _MaskedReactor(props) {
+        const h = this._h.bind(this);
+        const size = props.size;
+        const overlap = props.overlap;
+        const spacing = props.spacing;
 
-        if (this._shouldHide(message, settings)) return null;
+        const proportionalInnerRadius = 1 / 2;
+        const proportionalOuterRadius = proportionalInnerRadius + spacing;
+        const absoluteOffset = (overlap - spacing) * size;
 
-        return this._h(ReactorsComponent, {
-            message,
-            emoji,
-            count,
-            type,
+        const maskId = this._useUniqueMaskId();
+
+        return h(
+            "svg",
+            { style: { marginRight: `${-absoluteOffset}px` }, width: size, height: size },
+            h(
+                "defs",
+                null,
+                h(
+                    "mask",
+                    { id: maskId, maskContentUnits: "objectBoundingBox", viewBox: "0 0 1 1" },
+                    h("rect", { fill: "white", width: "1", height: "1" }),
+                    h("circle", {
+                        fill: "black",
+                        cx: 2 * proportionalInnerRadius + proportionalOuterRadius - overlap,
+                        cy: "0.5",
+                        r: proportionalOuterRadius
+                    })
+                )
+            ),
+            h(
+                "foreignObject",
+                { width: "100%", height: "100%", mask: `url(#${maskId})` },
+                h(this.ReactorC, { size, user: props.user, guildId: props.guildId })
+            )
+        );
+    }
+
+    _Reactors(props) {
+        const h = this._h.bind(this);
+        const count = props.count;
+        const users = props.users || [];
+        const max = props.max;
+        const size = props.size;
+        const overlap = props.overlap;
+        const spacing = props.spacing;
+        const channel = props.channel;
+        const guildId = channel && channel.guild_id;
+
+        const validUsers = users.filter(user => user && typeof user === "object" && (
+            user.id || user.username || user.globalName || user.global_name || user.avatar || user.avatarURL || user.getAvatarURL
+        ));
+        this.diag.data.invalidUsersSkipped += users.length - validUsers.length;
+        const totalCount = Math.max(0, Number(count) || 0);
+        const usersShown = Math.min(max, validUsers.length, totalCount || validUsers.length);
+        const hasMoreUsers = totalCount > usersShown;
+        const userSummary = validUsers.slice(0, usersShown);
+
+        const makeMoreBadge = remaining => h(
+            "div",
+            {
+                key: "more",
+                className: "bd-who-reacted__more-reactors",
+                title: `${remaining} more reactor${remaining === 1 ? "" : "s"}`,
+                "aria-label": `${remaining} more reactor${remaining === 1 ? "" : "s"}`,
+                style: {
+                    height: `${size}px`,
+                    minWidth: `${size}px`,
+                    padding: `0 ${Math.max(3, size * 0.22)}px`,
+                    borderRadius: `${size / 2}px`,
+                    fontSize: `${Math.max(9, size * 0.44)}px`
+                }
+            },
+            `+${remaining}`
+        );
+
+        // Store/user resolution can be temporarily empty even while the
+        // native pill still has a positive count. Never render an empty img
+        // placeholder in that state; keep the information as a count badge.
+        if (userSummary.length === 0 && totalCount > 0) {
+            return h("div", { className: "bd-who-reacted__reactors" }, [makeMoreBadge(totalCount)]);
+        }
+
+        const children = userSummary.map((user, index) => {
+            const isLast = index === usersShown - 1;
+            return isLast
+                ? h(this.ReactorC, { key: user.id || index, size, user, guildId })
+                : h(this.MaskedReactorC, { key: user.id || index, size, user, guildId, overlap, spacing });
+        });
+
+        if (hasMoreUsers) {
+            children.push(makeMoreBadge(totalCount - usersShown));
+        }
+
+        if (children.length === 0) return null;
+
+        return h("div", { className: "bd-who-reacted__reactors" }, children);
+    }
+
+    _useSettings() {
+        const self = this;
+        // Faux "store" for our settings emitter. IMPORTANT: always consumed
+        // via our OWN _manualUseStateFromStores — Discord's real
+        // useStateFromStores expects Flux stores (addReactChangeListener,
+        // getDispatchToken, ...) and would throw on this object. The alias
+        // methods below are defense in depth only.
+        const fauxStore = this._settingsFauxStore || (this._settingsFauxStore = {
+            addChangeListener: (cb) => self.listeners.add(cb),
+            removeChangeListener: (cb) => self.listeners.delete(cb),
+            addReactChangeListener: (cb) => self.listeners.add(cb),
+            removeReactChangeListener: (cb) => self.listeners.delete(cb)
+        });
+
+        return this._manualUseStateFromStores([fauxStore], () => ({
+            settings: self.settings,
+            defaults: self.defaults
+        }), []);
+    }
+
+    _reactionKey(channelId, messageId, emoji, type) {
+        return `${channelId || ""}:${messageId || ""}:${emoji && (emoji.id || emoji.name) || ""}:${type || 0}`;
+    }
+
+    // message.reactions is a plain array on most builds, but some Discord
+    // versions expose a Collection-like object instead — normalize both
+    // shapes so callers never have to special-case it.
+    _reactionsArray(message) {
+        if (!message || !message.reactions) return [];
+        if (Array.isArray(message.reactions)) return message.reactions;
+        if (typeof message.reactions.toArray === "function") return message.reactions.toArray();
+        return [];
+    }
+
+    _exceedsReactionThresholds(message) {
+        const settings = this.settings || this.defaults;
+        const reactions = this._reactionsArray(message);
+
+        if (settings.emojiThreshold && reactions.length > settings.emojiThreshold) {
+            return true;
+        }
+
+        if (settings.reactionsTotalThreshold) {
+            const total = reactions.reduce((sum, reaction) => sum + (reaction && reaction.count ? reaction.count : 0), 0);
+            if (total > settings.reactionsTotalThreshold) return true;
+        }
+
+        if (settings.reactionsPerEmojiThreshold) {
+            for (const reaction of reactions) {
+                if (reaction && reaction.count > settings.reactionsPerEmojiThreshold) return true;
+            }
+        }
+
+        return false;
+    }
+
+    _effectiveReactionCount(message, emoji, type, suppliedCount, knownUsersCount) {
+        const direct = Number(suppliedCount);
+        if (Number.isFinite(direct) && direct > 0) return direct;
+
+        try {
+            const reactions = this._reactionsArray(message);
+            const match = reactions.find(reaction => {
+                const reactionEmoji = reaction && reaction.emoji;
+                if (!reactionEmoji || !emoji) return false;
+                if (emoji.id || reactionEmoji.id) return String(emoji.id || "") === String(reactionEmoji.id || "");
+                return String(emoji.name || "") === String(reactionEmoji.name || "");
+            });
+            if (match) {
+                const details = match.count_details || match.countDetails;
+                const typed = Number(type) === 1
+                    ? Number(details && (details.burst ?? details.super))
+                    : Number(details && details.normal);
+                if (Number.isFinite(typed) && typed > 0) return typed;
+                const total = Number(match.count);
+                if (Number.isFinite(total) && total > 0) return total;
+            }
+        } catch (err) { /* fall back to known user count */ }
+
+        return Math.max(0, Number(knownUsersCount) || 0);
+    }
+
+    _cacheReactionUsers(key, users) {
+        if (!key || !Array.isArray(users) || users.length === 0) return;
+        this.reactionUsersCache.delete(key);
+        const userLimit = Math.max(1, Math.min(
+            this.reactionUsersCacheUserMax,
+            Number(this.settings?.max) || this.defaults.max
+        ));
+        this.reactionUsersCache.set(key, { users: users.slice(0, userLimit), timestamp: Date.now() });
+        while (this.reactionUsersCache.size > this.reactionUsersCacheMax) {
+            this.reactionUsersCache.delete(this.reactionUsersCache.keys().next().value);
+        }
+        this.diag.data.reactionCacheEntries = this.reactionUsersCache.size;
+    }
+
+    _getCachedReactionUsers(key) {
+        const entry = this.reactionUsersCache.get(key);
+        if (!entry) return [];
+        if (Date.now() - entry.timestamp > this.reactionUsersCacheTtl) {
+            this.reactionUsersCache.delete(key);
+            this.diag.data.reactionCacheEntries = this.reactionUsersCache.size;
+            return [];
+        }
+        this.diag.data.reactionCacheHits++;
+        return entry.users;
+    }
+
+    // Top level component rendered for every reaction pill, regardless of
+    // which injection strategy placed it. Encapsulates threshold logic,
+    // filters, live store subscriptions, and rendering.
+    _readReactionUsers(channelId, messageId, emoji, type) {
+        const ReactionStore = this.mods.ReactionStore;
+        const UserStore = this.mods.UserStore;
+        if (
+            !ReactionStore ||
+            typeof ReactionStore.getReactions !== "function" ||
+            !UserStore ||
+            typeof UserStore.getUser !== "function" ||
+            !channelId ||
+            !messageId ||
+            !emoji
+        ) return [];
+
+        let reactions = null;
+        try {
+            reactions = ReactionStore.getReactions(channelId, messageId, emoji, 100, type) || {};
+        } catch (err) {
+            this._logError("ReactionStore.getReactions threw:", err);
+            return [];
+        }
+
+        const users = [];
+        const seen = new Set();
+        const addUser = (id, value) => {
+            let user = value && typeof value === "object" && value.id ? value : null;
+            if (!user) {
+                try { user = UserStore.getUser(id); } catch (err) { user = null; }
+            }
+            if (!user || !user.id || seen.has(user.id)) return;
+            seen.add(user.id);
+            users.push(user);
+        };
+
+        try {
+            if (reactions instanceof Map) {
+                for (const [id, value] of reactions.entries()) addUser(id, value);
+            } else if (Array.isArray(reactions)) {
+                for (const value of reactions) addUser(typeof value === "string" ? value : value && value.id, value);
+            } else if (reactions && typeof reactions === "object") {
+                for (const [id, value] of Object.entries(reactions)) addUser(id, value);
+            }
+        } catch (err) {
+            this._logError("Failed to normalize reaction users:", err);
+        }
+
+        const maxUsers = Math.max(
+            1,
+            Math.min(50, Number(this.settings?.max) || this.defaults.max)
+        );
+        const result = users.slice(0, maxUsers);
+        this.diag.data.getReactionsCalls++;
+        this.diag.data.lastReactionsCount = result.length;
+        this._saveDiag(false);
+        return result;
+    }
+
+    _WhoReactedReactors(props) {
+        const self = this;
+        const h = this._h.bind(this);
+        const message = props.message;
+        const emoji = props.emoji;
+        const count = props.count;
+        const type = props.type;
+
+        // RULES OF HOOKS: every hook below runs unconditionally, in the same
+        // order, on every render. All early-return conditions are evaluated
+        // only AFTER the last hook call.
+
+        const { settings } = this._useSettings();
+
+        const ChannelStore = this.mods.ChannelStore;
+        const ReactionStore = this.mods.ReactionStore;
+        const UserStore = this.mods.UserStore;
+        const RelationshipStore = this.mods.RelationshipStore;
+        const useStateFromStores = this.mods.useStateFromStores;
+
+        let channelId = null;
+        try {
+            if (message) {
+                channelId = typeof message.getChannelId === "function" ? message.getChannelId() : message.channel_id;
+            }
+        } catch (err) { /* ignore */ }
+
+        const messageId = message ? message.id : null;
+        const hideByThreshold = self._exceedsReactionThresholds(message);
+
+        const channel = useStateFromStores(
+            [ChannelStore],
+            () => {
+                try { return channelId ? ChannelStore.getChannel(channelId) : null; } catch (err) { return null; }
+            },
+            [channelId]
+        );
+
+        const rawUsersState = useStateFromStores(
+            [ReactionStore],
+            () => hideByThreshold ? [] : self._readReactionUsers(channelId, messageId, emoji, type),
+            [hideByThreshold, channelId, messageId, emoji && emoji.name, emoji && emoji.id, type]
+        );
+        const rawUsers = Array.isArray(rawUsersState) ? rawUsersState : [];
+
+        // Keep the last confirmed result beyond a single React root's
+        // lifetime so Discord's virtualized pill replacement cannot flash
+        // the avatars away while MessageReactionsStore briefly reports empty.
+        const reactionKey = self._reactionKey(channelId, messageId, emoji, type);
+        if (rawUsers.length > 0) self._cacheReactionUsers(reactionKey, rawUsers);
+        const stableRawUsers = rawUsers.length > 0 ? rawUsers : self._getCachedReactionUsers(reactionKey);
+        const effectiveCount = self._effectiveReactionCount(message, emoji, type, count, stableRawUsers.length);
+        self.diag.data.lastEffectiveCount = effectiveCount;
+
+        // Discord does NOT populate MessageReactionsStore until something
+        // requests the reactor list (normally hovering the reaction
+        // tooltip). No internal module could be identified that reliably
+        // triggers this fetch without risking a crash (see _resolveModules
+        // history), so until then this shows a "+N" count badge instead of
+        // avatars for reactions the store hasn't been asked about yet.
+
+        // ---- all hooks are done; conditions may return early from here ----
+
+        if (!message || !emoji || hideByThreshold) {
+            return null;
+        }
+
+        let users = stableRawUsers;
+
+        if (settings.hideSelf && UserStore) {
+            try {
+                const currentUser = UserStore.getCurrentUser();
+                if (currentUser) users = users.filter(u => u && u.id !== currentUser.id);
+            } catch (err) { /* ignore */ }
+        }
+
+        if (settings.hideBots) {
+            users = users.filter(u => u && !u.bot);
+        }
+
+        if (settings.hideBlocked && RelationshipStore) {
+            try {
+                users = users.filter(u => u && !RelationshipStore.isBlocked(u.id));
+            } catch (err) { /* ignore */ }
+        }
+
+        return h(this.ReactorsC, {
+            count: effectiveCount,
+            channel: channel || {},
+            users,
             max: settings.max,
             size: settings.avatarSize,
             overlap: settings.avatarOverlap / 100,
@@ -503,332 +1057,395 @@ module.exports = class WhoReacted {
         });
     }
 
-    _withStoresConnected(ReactorsComponent) {
-        return props => {
-            const message = props.message;
-            const channelId = this._getChannelId(message);
-            const ChannelStore = this.modules.ChannelStore;
-            const channel = this._useStateFromStores(
-                [ChannelStore],
-                () => {
-                    try {
-                        return ChannelStore.getChannel(channelId);
-                    } catch (err) {
-                        return null;
-                    }
-                }
-            );
-            const users = this._useStateFromStores(
-                [this.modules.ReactionStore],
-                () => this._getReactionUsers(message, props.emoji, props.type, props.count)
-            );
-
-            return this._h(ReactorsComponent, Object.assign({}, props, {
-                channel,
-                users
-            }));
-        };
+    _renderReactorsElement(message, emoji, count, type) {
+        // this.RootC is a stable reference created once in the constructor,
+        // so React preserves component state across re-renders instead of
+        // remounting a fresh anonymous component every time.
+        return this._h(this.RootC, { message, emoji, count, type });
     }
 
-    _withSelfHidden(ReactorsComponent) {
-        return props => {
-            const currentUser = this._useStateFromStores(
-                [this.modules.UserStore],
-                () => this.modules.UserStore.getCurrentUser()
-            );
-            const currentId = currentUser && currentUser.id;
-            return this._h(ReactorsComponent, Object.assign({}, props, {
-                users: props.users.filter(user => user && user.id !== currentId)
-            }));
-        };
-    }
+    /* ------------------------------------------------------------------ *
+     *  Strategy B: DOM injection via MutationObserver + fiber walk
+     * ------------------------------------------------------------------ */
 
-    _withBotsHidden(ReactorsComponent) {
-        return props => this._h(ReactorsComponent, Object.assign({}, props, {
-            users: props.users.filter(user => user && !user.bot)
-        }));
-    }
-
-    _withBlockedHidden(ReactorsComponent) {
-        return props => {
-            const relationshipRevision = this._useStateFromStores(
-                [this.modules.RelationshipStore],
-                () => Date.now()
-            );
-            const users = BdApi.React.useMemo(() => props.users.filter(user => {
-                try {
-                    return user && !this.modules.RelationshipStore.isBlocked(user.id);
-                } catch (err) {
-                    return true;
-                }
-            }), [props.users, relationshipRevision]);
-
-            return this._h(ReactorsComponent, Object.assign({}, props, { users }));
-        };
-    }
-
-    _Reactors({ count, channel, users, max, size, overlap, spacing }) {
-        const safeUsers = Array.isArray(users) ? users.filter(Boolean) : [];
-        const numericCount = Number(count);
-        const totalCount = Number.isFinite(numericCount) ? Math.max(0, numericCount) : safeUsers.length;
-        const usersShown = Math.min(Math.max(0, Number(max) || 0), safeUsers.length);
-        const userSummary = safeUsers.slice(0, usersShown);
-        const children = [];
-
-        userSummary.forEach((user, index) => {
-            const isLast = index === userSummary.length - 1;
-            const props = {
-                key: user.id || index,
-                size,
-                user,
-                guildId: channel?.guild_id
-            };
-            children.push(isLast
-                ? this._h(this.ReactorC, props)
-                : this._h(this.MaskedReactorC, Object.assign({}, props, { overlap, spacing }))
-            );
-        });
-
-        const remaining = Math.max(0, totalCount - usersShown);
-        if (remaining > 0) {
-            children.push(this._h(
-                "div",
-                {
-                    key: "more",
-                    className: "bd-who-reacted__more-reactors",
-                    style: {
-                        height: `${size}px`,
-                        minWidth: `${size}px`,
-                        padding: `0 ${size / 3}px`,
-                        borderRadius: `${size / 2}px`,
-                        fontSize: `${size / 2}px`
-                    }
-                },
-                `+${remaining}`
-            ));
+    _startStrategyB() {
+        if (typeof document === "undefined" || typeof MutationObserver !== "function") {
+            this._logError("Strategy B: DOM APIs are unavailable.");
+            return false;
         }
 
-        if (children.length === 0) return null;
-        return this._h("div", { className: "bd-who-reacted__reactors" }, children);
+        const root = document.querySelector("#app-mount") || document.body;
+        if (!root) {
+            this._logError("Strategy B: could not find an app root to observe.");
+            return false;
+        }
+
+        try {
+            this.observer = new MutationObserver(this._onMutations);
+            this.observer.observe(root, { childList: true, subtree: true });
+            this.observedRoot = root;
+            this._queueScanRoot(root);
+            return true;
+        } catch (err) {
+            this._logError("Strategy B: failed to observe app root:", err);
+            this.observer = null;
+            this.observedRoot = null;
+            return false;
+        }
     }
 
-    _Reactor({ user, guildId, size }) {
-        let avatarUrl = "";
+    _queueScanRoot(root) {
+        if (!root || root.nodeType !== 1) return;
+
+        for (const queuedRoot of this.pendingScanRoots) {
+            if (queuedRoot === root || (queuedRoot.contains && queuedRoot.contains(root))) return;
+            if (root.contains && root.contains(queuedRoot)) {
+                this.pendingScanRoots.delete(queuedRoot);
+            }
+        }
+
+        this.pendingScanRoots.add(root);
+        this._scheduleScan();
+    }
+
+    _queueCleanupRoot(root) {
+        if (!root || root.nodeType !== 1) return;
+
+        for (const queuedRoot of this.pendingCleanupRoots) {
+            if (queuedRoot === root || (queuedRoot.contains && queuedRoot.contains(root))) return;
+            if (root.contains && root.contains(queuedRoot)) {
+                this.pendingCleanupRoots.delete(queuedRoot);
+            }
+        }
+
+        this.pendingCleanupRoots.add(root);
+        this._scheduleScan();
+    }
+
+    _scheduleScan() {
+        if (this.scanFrameId !== null || typeof requestAnimationFrame !== "function") return;
+
+        this.scanFrameId = requestAnimationFrame(() => {
+            this.scanFrameId = null;
+            const roots = Array.from(this.pendingScanRoots);
+            const cleanupRoots = Array.from(this.pendingCleanupRoots);
+            this.pendingScanRoots.clear();
+            this.pendingCleanupRoots.clear();
+
+            if (!this.started) return;
+
+            for (const root of cleanupRoots) {
+                if (!root.isConnected) this._cleanupRemovedPills(root);
+            }
+            this._pruneDomRoots();
+
+            for (const root of roots) {
+                if (root.isConnected) this._scanForPills(root);
+            }
+        });
+    }
+
+    _pruneDomRoots() {
+        for (const [pillEl, entry] of Array.from(this.domRoots.entries())) {
+            if (pillEl.isConnected && entry.container && entry.container.isConnected) continue;
+            this._teardownDomEntry(entry);
+            this.domRoots.delete(pillEl);
+        }
+    }
+
+    _onMutations(mutations) {
+        if (!this.started) return;
+
+        for (const mutation of mutations || []) {
+            for (const node of mutation.addedNodes || []) {
+                if (node && node.nodeType === 1) this._queueScanRoot(node);
+            }
+            for (const node of mutation.removedNodes || []) {
+                if (node && node.nodeType === 1) this._queueCleanupRoot(node);
+            }
+        }
+    }
+
+    _scanForPills(root) {
         try {
-            if (user && typeof user.getAvatarURL === "function") {
-                avatarUrl = user.getAvatarURL(guildId, size);
-            } else if (user && user.avatar && user.id) {
-                avatarUrl = `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=${size}`;
-            } else if (user && user.id) {
-                const discriminator = Number(user.discriminator);
-                const index = Number.isFinite(discriminator) ? Math.abs(discriminator) % 5 : 0;
-                avatarUrl = `https://cdn.discordapp.com/embed/avatars/${index}.png`;
+            const pills = new Set();
+            if (root.matches && this._isReactionPillCandidate(root)) pills.add(root);
+            if (root.querySelectorAll) {
+                root.querySelectorAll('button[class*="reaction"], [role="button"][class*="reaction"]').forEach(el => pills.add(el));
+            }
+            for (const pill of pills) {
+                this._injectIntoPill(pill);
             }
         } catch (err) {
-            avatarUrl = "";
+            this._logError("Error scanning for reaction pills:", err);
         }
-
-        if (!avatarUrl) return null;
-        return this._h("img", {
-            className: "bd-who-reacted__reactor-avatar",
-            width: size,
-            height: size,
-            src: avatarUrl,
-            alt: ""
-        });
     }
 
-    _MaskedReactor({ user, guildId, size, overlap, spacing }) {
-        const innerRadius = 0.5;
-        const outerRadius = innerRadius + spacing;
-        const offset = (overlap - spacing) * size;
-        const maskId = `bd-who-reacted-mask-${this.maskIdCounter++}`;
-
-        return this._h(
-            "svg",
-            { style: { marginRight: `${-offset}px` }, width: size, height: size },
-            this._h(
-                "defs",
-                null,
-                this._h(
-                    "mask",
-                    { id: maskId, maskContentUnits: "objectBoundingBox", viewBox: "0 0 1 1" },
-                    this._h("rect", { fill: "white", width: "1", height: "1" }),
-                    this._h("circle", {
-                        fill: "black",
-                        cx: 2 * innerRadius + outerRadius - overlap,
-                        cy: "0.5",
-                        r: outerRadius
-                    })
-                )
-            ),
-            this._h(
-                "foreignObject",
-                { width: "100%", height: "100%", mask: `url(#${maskId})` },
-                this._h(this.ReactorC, { size, user, guildId })
-            )
-        );
+    _isReactionPillCandidate(element) {
+        if (!(element instanceof HTMLElement)) return false;
+        if (element.classList.contains("bd-who-reacted__container")) return false;
+        const className = typeof element.className === "string" ? element.className : "";
+        const isButton = element.tagName === "BUTTON" || element.getAttribute("role") === "button";
+        return isButton && className.toLowerCase().includes("reaction");
     }
 
-    _getReactionUsers(message, emoji, type, count) {
-        const channelId = this._getChannelId(message);
-        const messageId = message && message.id;
-        if (!channelId || !messageId || !emoji) return [];
+    _cleanupRemovedPills(root) {
+        try {
+            for (const [el, frameId] of Array.from(this.pillRetryFrames.entries())) {
+                if (root === el || (root.contains && root.contains(el))) {
+                    cancelAnimationFrame(frameId);
+                    this.pillRetryFrames.delete(el);
+                }
+            }
+            for (const [el, entry] of Array.from(this.domRoots.entries())) {
+                if (root === el || (root.contains && root.contains(el))) {
+                    this._teardownDomEntry(entry);
+                    this.domRoots.delete(el);
+                }
+            }
+        } catch (err) {
+            this._logError("Error cleaning up removed pills:", err);
+        }
+    }
 
-        const key = this._reactionKey(message, emoji, type);
-        const expectedCount = Number(count);
-        const normalizedCount = Number.isFinite(expectedCount) ? expectedCount : null;
-        const cached = this.reactionCache.get(key);
+    _schedulePillRetry(pillEl, attempt) {
         if (
-            cached &&
-            cached.revision === this.reactionRevision &&
-            cached.count === normalizedCount &&
-            Date.now() - cached.timestamp <= this.reactionCacheTtl
-        ) {
-            return cached.users;
-        }
+            !this.started ||
+            !pillEl ||
+            !pillEl.isConnected ||
+            attempt > this.maxPillRetries ||
+            typeof requestAnimationFrame !== "function"
+        ) return;
+        if (this.pillRetryFrames.has(pillEl)) return;
 
-        let reactions = {};
-        try {
-            reactions = this.modules.ReactionStore.getReactions(
-                channelId,
-                messageId,
-                emoji,
-                100,
-                type
-            ) || {};
-        } catch (err) {
-            this._log("getReactions failed:", err);
-        }
-
-        let users = [];
-        if (reactions instanceof Map) {
-            users = Array.from(reactions.entries()).map(([id, user]) => {
-                if (user && typeof user === "object" && user.id) return user;
-                return this.modules.UserStore.getUser(id);
-            });
-        } else if (Array.isArray(reactions)) {
-            users = reactions.map(user => typeof user === "string"
-                ? this.modules.UserStore.getUser(user)
-                : user
-            );
-        } else if (reactions && typeof reactions === "object") {
-            users = Object.entries(reactions).map(([id, user]) => {
-                if (user && typeof user === "object" && user.id) return user;
-                return this.modules.UserStore.getUser(id);
-            });
-        }
-
-        const filteredUsers = users.filter(user => user && user.id);
-        this.reactionCache.set(key, {
-            revision: this.reactionRevision,
-            count: normalizedCount,
-            users: filteredUsers,
-            timestamp: Date.now()
+        const frameId = requestAnimationFrame(() => {
+            this.pillRetryFrames.delete(pillEl);
+            if (this.started && pillEl.isConnected) this._injectIntoPill(pillEl, attempt);
         });
-        return filteredUsers;
+        this.pillRetryFrames.set(pillEl, frameId);
     }
 
-    _shouldHide(message, settings) {
-        const reactions = Array.isArray(message?.reactions) ? message.reactions : [];
-        const emojiThreshold = Number(settings.emojiThreshold);
-        if (emojiThreshold > 0 && reactions.length > emojiThreshold) return true;
+    _teardownDomEntry(entry) {
+        if (!entry) return;
 
-        const totalThreshold = Number(settings.reactionsTotalThreshold);
-        if (totalThreshold > 0) {
-            const total = reactions.reduce((sum, reaction) => {
-                const count = Number(reaction?.count);
-                return sum + (Number.isFinite(count) && count > 0 ? count : 0);
-            }, 0);
-            if (total > totalThreshold) return true;
-        }
-
-        const perEmojiThreshold = Number(settings.reactionsPerEmojiThreshold);
-        if (perEmojiThreshold > 0) {
-            return reactions.some(reaction => {
-                const count = Number(reaction?.count);
-                return Number.isFinite(count) && count > perEmojiThreshold;
-            });
-        }
-
-        return false;
-    }
-
-    _getChannelId(message) {
         try {
-            return typeof message?.getChannelId === "function"
-                ? message.getChannelId()
-                : message?.channel_id;
-        } catch (err) {
-            return null;
-        }
-    }
-
-    _reactionKey(message, emoji, type) {
-        return `${this._getChannelId(message) || ""}:${message?.id || ""}:${emoji?.id || emoji?.name || ""}:${type || 0}`;
-    }
-
-    _normalizeSettings(raw) {
-        const settings = Object.assign({}, this.defaults, raw && typeof raw === "object" ? raw : {});
-        const number = (value, min, max, fallback) => {
-            const parsed = Number(value);
-            return Number.isFinite(parsed)
-                ? Math.min(max, Math.max(min, parsed))
-                : fallback;
-        };
-        const boolean = value => value === true || value === 1 || value === "true";
-
-        settings.max = number(settings.max, 1, 100, this.defaults.max);
-        settings.avatarSize = number(settings.avatarSize, 8, 48, this.defaults.avatarSize);
-        settings.avatarOverlap = number(settings.avatarOverlap, 0, 100, this.defaults.avatarOverlap);
-        settings.avatarSpacing = number(settings.avatarSpacing, 0, 50, this.defaults.avatarSpacing);
-        settings.emojiThreshold = number(settings.emojiThreshold, 0, 20, this.defaults.emojiThreshold);
-        settings.reactionsTotalThreshold = number(settings.reactionsTotalThreshold, 0, 10000, this.defaults.reactionsTotalThreshold);
-        settings.reactionsPerEmojiThreshold = number(settings.reactionsPerEmojiThreshold, 0, 500, this.defaults.reactionsPerEmojiThreshold);
-        settings.hideSelf = boolean(settings.hideSelf);
-        settings.hideBots = boolean(settings.hideBots);
-        settings.hideBlocked = boolean(settings.hideBlocked);
-        return settings;
-    }
-
-    _loadSettings() {
-        let saved = null;
-        try {
-            saved = BdApi.Data.load(this.name, "settings");
-        } catch (err) {
-            this._log("Failed to load settings:", err);
-        }
-        this.settings = this._normalizeSettings(saved);
-    }
-
-    updateSetting(name, value) {
-        if (!Object.prototype.hasOwnProperty.call(this.defaults, name)) return;
-        this.settings = this._normalizeSettings(Object.assign({}, this.settings, { [name]: value }));
-        try {
-            BdApi.Data.save(this.name, "settings", this.settings);
-        } catch (err) {
-            this._log("Failed to save settings:", err);
-        }
-        for (const listener of this.settingsListeners) {
-            try {
-                listener();
-            } catch (err) {
-                this._log("Settings listener failed:", err);
+            if (entry.root && typeof entry.root.unmount === "function") {
+                entry.root.unmount();
+            } else if (
+                typeof BdApi !== "undefined" &&
+                BdApi.ReactDOM &&
+                typeof BdApi.ReactDOM.unmountComponentAtNode === "function"
+            ) {
+                BdApi.ReactDOM.unmountComponentAtNode(entry.container);
             }
+        } catch (err) {
+            this._logError("Error unmounting DOM root:", err);
+        }
+
+        try {
+            if (entry.container && entry.container.parentNode) {
+                entry.container.parentNode.removeChild(entry.container);
+            }
+        } catch (err) {
+            this._logError("Error removing DOM root:", err);
+        }
+
+        try {
+            if (entry.pillEl && entry.pillEl.classList) {
+                entry.pillEl.classList.remove("bd-who-reacted__pill");
+            }
+        } catch (err) {
+            this._logError("Error restoring reaction pill class:", err);
         }
     }
 
-    _buildSettingsPanel() {
-        const settings = this.settings;
-        const thresholdMarker = value => {
-            if (Number(value) === 0) return "Off";
-            if (Number(value) >= 1000) return `${Number(value) / 1000}k`;
-            return `${value}`;
-        };
-        const pxMarker = value => `${value}px`;
-        const percentMarker = value => `${Number(value).toFixed(2)}%`;
+    _injectIntoPill(pillEl, retryAttempt = 0) {
+        if (!pillEl || pillEl.isConnected === false) return;
+        if (retryAttempt === 0 && this.pillRetryFrames.has(pillEl)) return;
+        if (retryAttempt === 0) this.diag.strategyB.pillsSeen++;
 
-        const schema = [
+        let props = null;
+        let internalInstance = null;
+        try {
+            if (
+                typeof BdApi === "undefined" ||
+                !BdApi.ReactUtils ||
+                typeof BdApi.ReactUtils.getInternalInstance !== "function"
+            ) return;
+
+            internalInstance = BdApi.ReactUtils.getInternalInstance(pillEl);
+            props = this._findReactionPropsInFiber(internalInstance, 25);
+        } catch (err) {
+            this._logError("Strategy B: fiber walk failed:", err);
+        }
+
+        if (!props || !props.message || !props.emoji) {
+            this.diag.strategyB.fiberPropsMissing++;
+            if (!this.diag.strategyB.sampleFiberPropKeys && internalInstance) {
+                this.diag.strategyB.sampleFiberPropKeys = this._sampleFiberPropKeys(internalInstance);
+            }
+            this._saveDiag(false);
+            this._schedulePillRetry(pillEl, retryAttempt + 1);
+            return;
+        }
+
+        this.diag.strategyB.fiberPropsFound++;
+
+        let channelId = null;
+        try {
+            channelId = typeof props.message.getChannelId === "function"
+                ? props.message.getChannelId()
+                : props.message.channel_id;
+        } catch (err) {
+            channelId = null;
+        }
+
+        const reactionKey = this._reactionKey(channelId, props.message.id, props.emoji, props.type);
+        const existing = this.domRoots.get(pillEl);
+
+        if (existing && existing.reactionKey === reactionKey && existing.container && existing.container.isConnected !== false) {
+            return;
+        }
+
+        if (this._exceedsReactionThresholds(props.message)) {
+            if (existing) {
+                this._teardownDomEntry(existing);
+                this.domRoots.delete(pillEl);
+            }
+            return;
+        }
+
+        if (existing) {
+            this._teardownDomEntry(existing);
+            this.domRoots.delete(pillEl);
+        }
+
+        try {
+            const staleContainer = pillEl.querySelector && pillEl.querySelector(".bd-who-reacted__container");
+            if (staleContainer) this._teardownDomEntry({ container: staleContainer, pillEl });
+        } catch (err) {
+            this._logError("Strategy B: failed to remove stale container:", err);
+        }
+
+        let container = null;
+        try {
+            if (typeof document === "undefined" || typeof document.createElement !== "function") {
+                return;
+            }
+
+            container = document.createElement("span");
+            container.className = "bd-who-reacted__container";
+            pillEl.classList.add("bd-who-reacted__pill");
+            pillEl.appendChild(container);
+
+            const element = this._renderReactorsElement(props.message, props.emoji, props.count, props.type);
+            const ReactDOM = typeof BdApi !== "undefined" ? BdApi.ReactDOM : null;
+            let root = null;
+
+            if (ReactDOM && typeof ReactDOM.createRoot === "function") {
+                root = ReactDOM.createRoot(container);
+                root.render(element);
+            } else if (ReactDOM && typeof ReactDOM.render === "function") {
+                ReactDOM.render(element, container);
+            } else {
+                throw new Error("No usable ReactDOM render API found.");
+            }
+
+            this.diag.strategyB.rendersOk++;
+            this._saveDiag(false);
+            this.domRoots.set(pillEl, { root, container, pillEl, reactionKey });
+        } catch (err) {
+            this.diag.strategyB.renderErrors++;
+            this._logError("Strategy B: failed to render into pill:", err);
+            if (container) {
+                try { container.remove(); } catch (removeErr) { /* best effort */ }
+            }
+            try { pillEl.classList.remove("bd-who-reacted__pill"); } catch (classErr) { /* best effort */ }
+        }
+    }
+
+    // Walks up from the pill's fiber collecting the prop KEYS at each level
+    // (values omitted) — enough to see the actual component prop shape from
+    // the saved diagnostics without console access.
+    _sampleFiberPropKeys(fiber) {
+        const samples = [];
+        try {
+            let node = fiber;
+            let depth = 0;
+            while (node && depth < 12 && samples.length < 6) {
+                const props = node.memoizedProps || node.pendingProps;
+                if (props && typeof props === "object" && !Array.isArray(props)) {
+                    const keys = Object.keys(props).slice(0, 15);
+                    if (keys.length) samples.push({ depth, keys });
+                }
+                node = node.return;
+                depth++;
+            }
+        } catch (err) { /* best effort */ }
+        return samples;
+    }
+
+    _findReactionPropsInFiber(fiber, maxDepth) {
+        let node = fiber;
+        let depth = 0;
+        const limit = Math.max(1, Number(maxDepth) || 25);
+        const visited = new Set();
+
+        while (node && depth < limit) {
+            if (visited.has(node)) break;
+            visited.add(node);
+
+            let props = null;
+            try {
+                props = node.memoizedProps || node.pendingProps;
+            } catch (err) {
+                props = null;
+            }
+
+            if (props && props.message && props.emoji) {
+                return {
+                    message: props.message,
+                    emoji: props.emoji,
+                    count: props.count == null ? 0 : props.count,
+                    type: props.type == null ? 0 : props.type
+                };
+            }
+            if (props && props.message && props.reaction && props.reaction.emoji) {
+                return {
+                    message: props.message,
+                    emoji: props.reaction.emoji,
+                    count: props.reaction.count == null ? 0 : props.reaction.count,
+                    type: props.type == null ? (props.reaction.type || 0) : props.type
+                };
+            }
+
+            try {
+                node = node.return;
+            } catch (err) {
+                node = null;
+            }
+            depth++;
+        }
+
+        return null;
+    }
+
+    /* ------------------------------------------------------------------ *
+     *  Settings panel
+     * ------------------------------------------------------------------ */
+
+    _buildSettingsPanelViaBdApi() {
+        const self = this;
+
+        const pctMarker = v => `${Number(v).toFixed(2)}%`;
+        const pxMarker = v => `${v}px`;
+        const thresholdMarker = v => {
+            if (v === 0) return "Off";
+            if (v >= 1000) return `${v / 1000}k`;
+            return `${v}`;
+        };
+
+        const settingsSchema = [
             {
                 type: "category",
                 id: "appearance",
@@ -840,48 +1457,48 @@ module.exports = class WhoReacted {
                         id: "max",
                         name: "Maximum Avatars",
                         note: "Sets the maximum number of avatars shown per emoji.",
-                        value: settings.max,
+                        value: self.settings.max,
                         min: 1,
-                        max: 100,
+                        max: 20,
                         step: 1,
-                        onChange: value => this.updateSetting("max", value)
+                        onChange: v => self.updateSetting("max", v)
                     },
                     {
                         type: "slider",
                         id: "avatarSize",
                         name: "Avatar Size",
                         note: "Sets the size of the avatars.",
-                        value: settings.avatarSize,
+                        value: self.settings.avatarSize,
                         min: 8,
                         max: 48,
                         step: 1,
                         markers: [8, 12, 16, 20, 24, 32, 40, 48],
                         onMarkerRender: pxMarker,
-                        onChange: value => this.updateSetting("avatarSize", value)
+                        onChange: v => self.updateSetting("avatarSize", v)
                     },
                     {
                         type: "slider",
                         id: "avatarOverlap",
                         name: "Avatar Overlap",
                         note: "Sets how much an avatar covers the previous one.",
-                        value: settings.avatarOverlap,
+                        value: self.settings.avatarOverlap,
                         min: 0,
                         max: 100,
                         step: 1,
-                        onMarkerRender: percentMarker,
-                        onChange: value => this.updateSetting("avatarOverlap", value)
+                        onMarkerRender: pctMarker,
+                        onChange: v => self.updateSetting("avatarOverlap", v)
                     },
                     {
                         type: "slider",
                         id: "avatarSpacing",
                         name: "Avatar Spacing",
                         note: "Sets the gap between two avatars.",
-                        value: settings.avatarSpacing,
+                        value: self.settings.avatarSpacing,
                         min: 0,
                         max: 50,
                         step: 1,
-                        onMarkerRender: percentMarker,
-                        onChange: value => this.updateSetting("avatarSpacing", value)
+                        onMarkerRender: pctMarker,
+                        onChange: v => self.updateSetting("avatarSpacing", v)
                     }
                 ]
             },
@@ -895,37 +1512,37 @@ module.exports = class WhoReacted {
                         type: "slider",
                         id: "emojiThreshold",
                         name: "Emoji Threshold",
-                        note: "Hides reactors when distinct emoji reactions exceed this value. 0 disables it.",
-                        value: settings.emojiThreshold,
+                        note: "Hides the reactors when the number of distinct emoji reactions exceeds the threshold. 0 disables this.",
+                        value: self.settings.emojiThreshold,
                         min: 0,
                         max: 20,
                         step: 1,
                         onMarkerRender: thresholdMarker,
-                        onChange: value => this.updateSetting("emojiThreshold", value)
+                        onChange: v => self.updateSetting("emojiThreshold", v)
                     },
                     {
                         type: "slider",
                         id: "reactionsTotalThreshold",
                         name: "Reactions Total Threshold",
-                        note: "Hides reactors when the sum of reaction counts exceeds this value. 0 disables it.",
-                        value: settings.reactionsTotalThreshold,
+                        note: "Hides the reactors when the sum of all reaction counts exceeds the threshold. 0 disables this.",
+                        value: self.settings.reactionsTotalThreshold,
                         min: 0,
                         max: 10000,
                         step: 10,
                         onMarkerRender: thresholdMarker,
-                        onChange: value => this.updateSetting("reactionsTotalThreshold", value)
+                        onChange: v => self.updateSetting("reactionsTotalThreshold", v)
                     },
                     {
                         type: "slider",
                         id: "reactionsPerEmojiThreshold",
                         name: "Reactions per Emoji Threshold",
-                        note: "Hides reactors when one emoji exceeds this value. 0 disables it.",
-                        value: settings.reactionsPerEmojiThreshold,
+                        note: "Hides the reactors when a single emoji's reaction count exceeds the threshold. 0 disables this.",
+                        value: self.settings.reactionsPerEmojiThreshold,
                         min: 0,
                         max: 500,
                         step: 5,
                         onMarkerRender: thresholdMarker,
-                        onChange: value => this.updateSetting("reactionsPerEmojiThreshold", value)
+                        onChange: v => self.updateSetting("reactionsPerEmojiThreshold", v)
                     }
                 ]
             },
@@ -939,150 +1556,114 @@ module.exports = class WhoReacted {
                         type: "switch",
                         id: "hideSelf",
                         name: "Hide Self",
-                        value: settings.hideSelf,
-                        onChange: value => this.updateSetting("hideSelf", value)
+                        value: self.settings.hideSelf,
+                        onChange: v => self.updateSetting("hideSelf", v)
                     },
                     {
                         type: "switch",
                         id: "hideBots",
                         name: "Hide Bots",
-                        value: settings.hideBots,
-                        onChange: value => this.updateSetting("hideBots", value)
+                        value: self.settings.hideBots,
+                        onChange: v => self.updateSetting("hideBots", v)
                     },
                     {
                         type: "switch",
                         id: "hideBlocked",
                         name: "Hide Blocked Users",
-                        value: settings.hideBlocked,
-                        onChange: value => this.updateSetting("hideBlocked", value)
+                        value: self.settings.hideBlocked,
+                        onChange: v => self.updateSetting("hideBlocked", v)
                     }
                 ]
             }
         ];
 
         return BdApi.UI.buildSettingsPanel({
-            settings: schema,
+            settings: settingsSchema,
             onChange: (categoryOrId, idOrValue, maybeValue) => {
-                const id = maybeValue === undefined ? categoryOrId : idOrValue;
-                const value = maybeValue === undefined ? idOrValue : maybeValue;
-                this.updateSetting(id, value);
+                // Different BD versions call onChange with slightly different
+                // arities; handle both (id, value) and (category, id, value).
+                try {
+                    if (maybeValue !== undefined) {
+                        self.updateSetting(idOrValue, maybeValue);
+                    } else {
+                        self.updateSetting(categoryOrId, idOrValue);
+                    }
+                } catch (err) {
+                    self._logError("Settings onChange handler failed:", err);
+                }
             }
         });
     }
 
     _buildFallbackSettingsPanel() {
-        if (typeof document === "undefined") return null;
+        const self = this;
         const panel = document.createElement("div");
-        panel.className = "bd-who-reacted-settings";
-        panel.style.padding = "16px";
+        panel.style.display = "flex";
+        panel.style.flexDirection = "column";
+        panel.style.gap = "16px";
+        panel.style.color = "var(--text-normal)";
+
+        const addSlider = (label, id, min, max, step) => {
+            const wrap = document.createElement("div");
+            const title = document.createElement("div");
+            title.textContent = `${label}: `;
+            title.style.fontWeight = "600";
+            title.style.marginBottom = "4px";
+
+            const valueSpan = document.createElement("span");
+            valueSpan.textContent = String(self.settings[id]);
+            title.appendChild(valueSpan);
+
+            const input = document.createElement("input");
+            input.type = "range";
+            input.min = String(min);
+            input.max = String(max);
+            input.step = String(step);
+            input.value = String(self.settings[id]);
+            input.style.width = "100%";
+            input.addEventListener("input", () => {
+                const value = Number(input.value);
+                valueSpan.textContent = String(value);
+                self.updateSetting(id, value);
+            });
+
+            wrap.appendChild(title);
+            wrap.appendChild(input);
+            panel.appendChild(wrap);
+        };
 
         const addSwitch = (label, id) => {
-            const row = document.createElement("label");
-            row.style.display = "flex";
-            row.style.gap = "8px";
-            row.style.marginBottom = "12px";
+            const wrap = document.createElement("label");
+            wrap.style.display = "flex";
+            wrap.style.alignItems = "center";
+            wrap.style.gap = "8px";
+
             const input = document.createElement("input");
             input.type = "checkbox";
-            input.checked = this.settings[id];
-            input.addEventListener("change", () => this.updateSetting(id, input.checked));
-            row.append(input, document.createTextNode(label));
-            panel.appendChild(row);
+            input.checked = !!self.settings[id];
+            input.addEventListener("change", () => {
+                self.updateSetting(id, input.checked);
+            });
+
+            const span = document.createElement("span");
+            span.textContent = label;
+
+            wrap.appendChild(input);
+            wrap.appendChild(span);
+            panel.appendChild(wrap);
         };
 
-        const addNumber = (label, id, min, max, step) => {
-            const row = document.createElement("label");
-            row.style.display = "flex";
-            row.style.flexDirection = "column";
-            row.style.gap = "4px";
-            row.style.marginBottom = "12px";
-            const text = document.createElement("span");
-            text.textContent = label;
-            const input = document.createElement("input");
-            input.type = "number";
-            input.min = min;
-            input.max = max;
-            input.step = step;
-            input.value = this.settings[id];
-            input.addEventListener("change", () => this.updateSetting(id, input.value));
-            row.append(text, input);
-            panel.appendChild(row);
-        };
-
-        addNumber("Maximum Avatars", "max", 1, 100, 1);
-        addNumber("Avatar Size", "avatarSize", 8, 48, 1);
-        addNumber("Avatar Overlap (%)", "avatarOverlap", 0, 100, 1);
-        addNumber("Avatar Spacing (%)", "avatarSpacing", 0, 50, 1);
-        addNumber("Emoji Threshold (0 = off)", "emojiThreshold", 0, 20, 1);
-        addNumber("Reactions Total Threshold (0 = off)", "reactionsTotalThreshold", 0, 10000, 10);
-        addNumber("Reactions per Emoji Threshold (0 = off)", "reactionsPerEmojiThreshold", 0, 500, 5);
+        addSlider("Maximum Avatars", "max", 1, 20, 1);
+        addSlider("Avatar Size", "avatarSize", 8, 48, 1);
+        addSlider("Avatar Overlap (%)", "avatarOverlap", 0, 100, 1);
+        addSlider("Avatar Spacing (%)", "avatarSpacing", 0, 50, 1);
+        addSlider("Emoji Threshold (0 = off)", "emojiThreshold", 0, 20, 1);
+        addSlider("Reactions Total Threshold (0 = off)", "reactionsTotalThreshold", 0, 10000, 10);
+        addSlider("Reactions per Emoji Threshold (0 = off)", "reactionsPerEmojiThreshold", 0, 500, 5);
         addSwitch("Hide Self", "hideSelf");
         addSwitch("Hide Bots", "hideBots");
         addSwitch("Hide Blocked Users", "hideBlocked");
+
         return panel;
-    }
-
-    _injectStyles() {
-        const css = `
-.bd-who-reacted__reactors {
-    display: inline-flex;
-    align-items: center;
-    white-space: nowrap;
-    line-height: 1;
-}
-
-.bd-who-reacted__reactors:not(:empty) {
-    margin-left: 8px;
-}
-
-.bd-who-reacted__reactor-avatar {
-    display: block;
-    border-radius: 50%;
-    border: 1px solid var(--background-secondary);
-    object-fit: cover;
-}
-
-.bd-who-reacted__more-reactors {
-    box-sizing: border-box;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    color: var(--text-normal);
-    font-weight: 500;
-    background-color: var(--background-tertiary);
-}
-`;
-        BdApi.DOM.addStyle(this.name, css);
-    }
-
-    _removeStyles() {
-        try {
-            BdApi.DOM.removeStyle(this.name);
-        } catch (err) {
-            this._log("Failed to remove styles:", err);
-        }
-    }
-
-    _h() {
-        return BdApi.React.createElement.apply(BdApi.React, arguments);
-    }
-
-    _showToast(message, type) {
-        try {
-            if (BdApi.UI && typeof BdApi.UI.showToast === "function") {
-                BdApi.UI.showToast(message, { type });
-            }
-        } catch (err) {
-            this._log(message, err);
-        }
-    }
-
-    _log(...parts) {
-        try {
-            if (BdApi.Logger && typeof BdApi.Logger.error === "function") {
-                BdApi.Logger.error(this.name, ...parts);
-            }
-        } catch (err) {
-            // Logging must never interrupt plugin lifecycle.
-        }
     }
 };

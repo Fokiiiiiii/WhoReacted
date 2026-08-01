@@ -42,11 +42,22 @@ module.exports = class WhoReacted {
         this.pendingScanRoots = new Set();
         this.pendingCleanupRoots = new Set();
         this.pillRetryFrames = new Map(); // element -> requestAnimationFrame id
-        this.maxPillRetries = 2;
-        this.reactionUsersCache = new Map(); // reaction key -> {users, timestamp}
+        this.pillRetryFallbacks = new Map(); // element -> delayed retry timeout id
+        this.pillRetryExhausted = new WeakSet();
+        this.maxPillRetries = 5;
+        this.reactionUsersCache = new Map(); // reaction key -> {users, count, timestamp}
         this.reactionUsersCacheTtl = 60 * 1000;
         this.reactionUsersCacheMax = 100;
         this.reactionUsersCacheUserMax = 12;
+        this.reactionListeners = new Set();
+        this.reactionStoreListener = null;
+        this.reactionStoreRemove = null;
+        this.reactionStoreRevision = 0;
+        this.reactionStoreCache = new Map();
+        this.reactionFauxStore = {
+            addChangeListener: callback => this.reactionListeners.add(callback),
+            removeChangeListener: callback => this.reactionListeners.delete(callback)
+        };
 
         this.started = false;
 
@@ -113,6 +124,7 @@ module.exports = class WhoReacted {
             }
 
             this.started = true;
+            this._startReactionStoreListener();
 
             // DOM/MutationObserver injection works directly from the rendered
             // pill and stays valid even when pills first appear long after
@@ -162,6 +174,11 @@ module.exports = class WhoReacted {
                 cancelAnimationFrame(frameId);
             }
             this.pillRetryFrames.clear();
+            for (const timeoutId of this.pillRetryFallbacks.values()) {
+                clearTimeout(timeoutId);
+            }
+            this.pillRetryFallbacks.clear();
+            this.pillRetryExhausted = new WeakSet();
         } catch (err) {
             this._logError("Error tearing down DOM roots:", err);
         }
@@ -178,6 +195,7 @@ module.exports = class WhoReacted {
             this._diagSaveTimer = null;
         }
 
+        this._stopReactionStoreListener();
         this.reactionUsersCache.clear();
         this.strategy = null;
         this.started = false;
@@ -185,6 +203,7 @@ module.exports = class WhoReacted {
     }
 
     getSettingsPanel() {
+        if (!this.settings) this._loadSettings();
         try {
             if (BdApi.UI && typeof BdApi.UI.buildSettingsPanel === "function") {
                 return this._buildSettingsPanelViaBdApi();
@@ -217,9 +236,10 @@ module.exports = class WhoReacted {
         s.emojiThreshold = clamp(s.emojiThreshold, 0, 20, this.defaults.emojiThreshold);
         s.reactionsTotalThreshold = clamp(s.reactionsTotalThreshold, 0, 10000, this.defaults.reactionsTotalThreshold);
         s.reactionsPerEmojiThreshold = clamp(s.reactionsPerEmojiThreshold, 0, 500, this.defaults.reactionsPerEmojiThreshold);
-        s.hideSelf = Boolean(s.hideSelf);
-        s.hideBots = Boolean(s.hideBots);
-        s.hideBlocked = Boolean(s.hideBlocked);
+        const asBoolean = value => value === true || value === 1 || value === "true";
+        s.hideSelf = asBoolean(s.hideSelf);
+        s.hideBots = asBoolean(s.hideBots);
+        s.hideBlocked = asBoolean(s.hideBlocked);
 
         return s;
     }
@@ -242,7 +262,12 @@ module.exports = class WhoReacted {
         }
     }
     updateSetting(name, value) {
-        this.settings[name] = value;
+        if (!this.settings) this._loadSettings();
+        if (!Object.prototype.hasOwnProperty.call(this.defaults, name)) return;
+
+        this.settings = this._normalizeSettings(Object.assign({}, this.settings, {
+            [name]: value
+        }));
         this._saveSettings();
         this._notifyListeners();
     }
@@ -510,8 +535,9 @@ module.exports = class WhoReacted {
     _defaultAvatarUrl(user) {
         let defaultIndex = 0;
         try {
-            if (user && user.discriminator && user.discriminator !== "0") {
-                defaultIndex = Number(user.discriminator) % 5;
+            const discriminator = Number(user && user.discriminator);
+            if (Number.isFinite(discriminator) && user.discriminator !== "0") {
+                defaultIndex = Math.abs(discriminator) % 5;
             } else if (user && user.id) {
                 defaultIndex = Number((BigInt(user.id) >> 22n) % 6n);
             }
@@ -742,13 +768,17 @@ module.exports = class WhoReacted {
         }
 
         if (settings.reactionsTotalThreshold) {
-            const total = reactions.reduce((sum, reaction) => sum + (reaction && reaction.count ? reaction.count : 0), 0);
+            const total = reactions.reduce((sum, reaction) => {
+                const count = Number(reaction && reaction.count);
+                return sum + (Number.isFinite(count) && count > 0 ? count : 0);
+            }, 0);
             if (total > settings.reactionsTotalThreshold) return true;
         }
 
         if (settings.reactionsPerEmojiThreshold) {
             for (const reaction of reactions) {
-                if (reaction && reaction.count > settings.reactionsPerEmojiThreshold) return true;
+                const count = Number(reaction && reaction.count);
+                if (Number.isFinite(count) && count > settings.reactionsPerEmojiThreshold) return true;
             }
         }
 
@@ -781,30 +811,137 @@ module.exports = class WhoReacted {
         return Math.max(0, Number(knownUsersCount) || 0);
     }
 
-    _cacheReactionUsers(key, users) {
+    _cacheReactionUsers(key, users, count) {
         if (!key || !Array.isArray(users) || users.length === 0) return;
         this.reactionUsersCache.delete(key);
         const userLimit = Math.max(1, Math.min(
             this.reactionUsersCacheUserMax,
             Number(this.settings?.max) || this.defaults.max
         ));
-        this.reactionUsersCache.set(key, { users: users.slice(0, userLimit), timestamp: Date.now() });
+        const normalizedCount = Number(count);
+        this.reactionUsersCache.set(key, {
+            users: users.slice(0, userLimit),
+            count: Number.isFinite(normalizedCount) ? normalizedCount : null,
+            timestamp: Date.now()
+        });
         while (this.reactionUsersCache.size > this.reactionUsersCacheMax) {
             this.reactionUsersCache.delete(this.reactionUsersCache.keys().next().value);
         }
         this.diag.data.reactionCacheEntries = this.reactionUsersCache.size;
     }
 
-    _getCachedReactionUsers(key) {
+    _getCachedReactionUsers(key, expectedCount) {
         const entry = this.reactionUsersCache.get(key);
         if (!entry) return [];
-        if (Date.now() - entry.timestamp > this.reactionUsersCacheTtl) {
+
+        const normalizedCount = Number(expectedCount);
+        const count = Number.isFinite(normalizedCount) ? normalizedCount : null;
+        if (entry.count !== count || Date.now() - entry.timestamp > this.reactionUsersCacheTtl) {
             this.reactionUsersCache.delete(key);
             this.diag.data.reactionCacheEntries = this.reactionUsersCache.size;
             return [];
         }
         this.diag.data.reactionCacheHits++;
         return entry.users;
+    }
+
+    _startReactionStoreListener() {
+        const store = this.mods.ReactionStore;
+        const addListener = store && (store.addChangeListener || store.addReactChangeListener);
+        const removeListener = store && (store.removeChangeListener || store.removeReactChangeListener);
+        if (typeof addListener !== "function" || typeof removeListener !== "function" || this.reactionStoreListener) return;
+
+        this.reactionStoreListener = () => {
+            this.reactionStoreRevision++;
+            this.reactionStoreCache.clear();
+            for (const listener of this.reactionListeners) {
+                try {
+                    listener();
+                } catch (err) {
+                    this._logError("Reaction store listener threw:", err);
+                }
+            }
+        };
+
+        try {
+            addListener.call(store, this.reactionStoreListener);
+            this.reactionStoreRemove = removeListener;
+        } catch (err) {
+            this.reactionStoreListener = null;
+            this._logError("Failed to subscribe to ReactionStore:", err);
+        }
+    }
+
+    _stopReactionStoreListener() {
+        const store = this.mods.ReactionStore;
+        if (this.reactionStoreListener && this.reactionStoreRemove && store) {
+            try {
+                this.reactionStoreRemove.call(store, this.reactionStoreListener);
+            } catch (err) {
+                this._logError("Failed to unsubscribe from ReactionStore:", err);
+            }
+        }
+        this.reactionStoreListener = null;
+        this.reactionStoreRemove = null;
+        this.reactionListeners.clear();
+        this.reactionStoreCache.clear();
+    }
+
+    _getReactionUsers(channelId, messageId, emoji, type, hideByThreshold, count) {
+        if (hideByThreshold || !channelId || !messageId || !emoji) return [];
+
+        const key = this._reactionKey(channelId, messageId, emoji, type);
+        const numericCount = Number(count);
+        const normalizedCount = Number.isFinite(numericCount) ? numericCount : null;
+        const cached = this.reactionStoreCache.get(key);
+        if (
+            cached &&
+            cached.revision === this.reactionStoreRevision &&
+            cached.count === normalizedCount &&
+            (cached.users.length > 0 || Date.now() - cached.timestamp < 1000)
+        ) {
+            return cached.users;
+        }
+
+        const ReactionStore = this.mods.ReactionStore;
+        const UserStore = this.mods.UserStore;
+        let reactions = {};
+        try {
+            reactions = ReactionStore.getReactions(channelId, messageId, emoji, 100, type) || {};
+        } catch (err) {
+            this._logError("ReactionStore.getReactions threw:", err);
+        }
+
+        let list = [];
+        if (reactions instanceof Map) {
+            list = Array.from(reactions.entries(), ([id, value]) => {
+                if (value && typeof value === "object" && value.id) return value;
+                return UserStore && typeof UserStore.getUser === "function" ? UserStore.getUser(id) : null;
+            }).filter(Boolean);
+        } else if (Array.isArray(reactions)) {
+            list = reactions.map(value => {
+                if (typeof value === "string") {
+                    return UserStore && typeof UserStore.getUser === "function" ? UserStore.getUser(value) : null;
+                }
+                return value;
+            }).filter(Boolean);
+        } else if (reactions && typeof reactions === "object") {
+            list = Object.entries(reactions).map(([id, value]) => {
+                if (value && typeof value === "object" && value.id) return value;
+                return UserStore && typeof UserStore.getUser === "function" ? UserStore.getUser(id) : null;
+            }).filter(Boolean);
+        }
+
+        this.diag.data.getReactionsCalls++;
+        this.diag.data.lastReactionsCount = list.length;
+        this._saveDiag(false);
+        this.reactionStoreCache.set(key, {
+            revision: this.reactionStoreRevision,
+            count: normalizedCount,
+            users: list,
+            timestamp: Date.now()
+        });
+        return list;
     }
 
     // Top level component rendered for every reaction pill, regardless of
@@ -825,10 +962,8 @@ module.exports = class WhoReacted {
         const { settings } = this._useSettings();
 
         const ChannelStore = this.mods.ChannelStore;
-        const ReactionStore = this.mods.ReactionStore;
         const UserStore = this.mods.UserStore;
         const RelationshipStore = this.mods.RelationshipStore;
-        const useStateFromStores = this.mods.useStateFromStores;
 
         let channelId = null;
         try {
@@ -840,45 +975,26 @@ module.exports = class WhoReacted {
         const messageId = message ? message.id : null;
         const hideByThreshold = self._exceedsReactionThresholds(message);
 
-        const channel = useStateFromStores(
-            [ChannelStore],
-            () => {
-                try { return channelId ? ChannelStore.getChannel(channelId) : null; } catch (err) { return null; }
-            },
-            [channelId]
-        );
+        let channel = null;
+        try {
+            channel = channelId && ChannelStore && typeof ChannelStore.getChannel === "function"
+                ? ChannelStore.getChannel(channelId)
+                : null;
+        } catch (err) { /* ignore */ }
 
-        const rawUsers = useStateFromStores(
-            [ReactionStore],
-            () => {
-                if (hideByThreshold || !channelId || !messageId || !emoji) return [];
-                let reactions = {};
-                try {
-                    // Historical signature: (channelId, messageId, emoji, limit, type)
-                    // Call defensively with all args; extras are harmless if unused.
-                    reactions = ReactionStore.getReactions(channelId, messageId, emoji, 100, type) || {};
-                } catch (err) {
-                    self._logError("ReactionStore.getReactions threw:", err);
-                }
-                let list = [];
-                if (reactions instanceof Map) {
-                    list = Array.from(reactions.entries(), ([id, value]) => {
-                        if (value && typeof value === "object" && value.id) return value;
-                        return UserStore.getUser(id);
-                    }).filter(Boolean);
-                } else if (Array.isArray(reactions)) {
-                    list = reactions.map(value => typeof value === "string" ? UserStore.getUser(value) : value).filter(Boolean);
-                } else if (reactions && typeof reactions === "object") {
-                    list = Object.entries(reactions).map(([id, value]) => {
-                        if (value && typeof value === "object" && value.id) return value;
-                        return UserStore.getUser(id);
-                    }).filter(Boolean);
-                }
-                self.diag.data.getReactionsCalls++;
-                self.diag.data.lastReactionsCount = list.length;
-                self._saveDiag(false);
-                return list;
-            },
+        // Subscribe each root to the plugin-level relay instead of subscribing
+        // every root directly to Discord's global ReactionStore. The relay
+        // invalidates the shared result cache once per store change.
+        const rawUsers = self._manualUseStateFromStores(
+            [self.reactionFauxStore],
+            () => self._getReactionUsers(
+                channelId,
+                messageId,
+                emoji,
+                type,
+                hideByThreshold,
+                count
+            ),
             [hideByThreshold, channelId, messageId, emoji && emoji.name, emoji && emoji.id, type, count]
         );
 
@@ -886,8 +1002,10 @@ module.exports = class WhoReacted {
         // lifetime so Discord's virtualized pill replacement cannot flash
         // the avatars away while MessageReactionsStore briefly reports empty.
         const reactionKey = self._reactionKey(channelId, messageId, emoji, type);
-        if (rawUsers.length > 0) self._cacheReactionUsers(reactionKey, rawUsers);
-        const stableRawUsers = rawUsers.length > 0 ? rawUsers : self._getCachedReactionUsers(reactionKey);
+        if (rawUsers.length > 0) self._cacheReactionUsers(reactionKey, rawUsers, count);
+        const stableRawUsers = rawUsers.length > 0
+            ? rawUsers
+            : self._getCachedReactionUsers(reactionKey, count);
         const effectiveCount = self._effectiveReactionCount(message, emoji, type, count, stableRawUsers.length);
         self.diag.data.lastEffectiveCount = effectiveCount;
 
@@ -971,8 +1089,6 @@ module.exports = class WhoReacted {
         this.observer.observe(root, {
             childList: true,
             characterData: true,
-            attributes: true,
-            attributeFilter: ["aria-label", "data-list-item-id"],
             subtree: true
         });
 
@@ -1090,6 +1206,14 @@ module.exports = class WhoReacted {
                 if (root === el || (root.contains && root.contains(el))) {
                     cancelAnimationFrame(frameId);
                     this.pillRetryFrames.delete(el);
+                    this.pillRetryExhausted.delete(el);
+                }
+            }
+            for (const [el, timeoutId] of Array.from(this.pillRetryFallbacks.entries())) {
+                if (root === el || (root.contains && root.contains(el))) {
+                    clearTimeout(timeoutId);
+                    this.pillRetryFallbacks.delete(el);
+                    this.pillRetryExhausted.delete(el);
                 }
             }
             for (const [el, entry] of Array.from(this.domRoots.entries())) {
@@ -1104,7 +1228,23 @@ module.exports = class WhoReacted {
     }
 
     _schedulePillRetry(pillEl, attempt) {
-        if (!this.started || !pillEl || !pillEl.isConnected || attempt > this.maxPillRetries) return;
+        if (!this.started || !pillEl || !pillEl.isConnected) return;
+
+        if (attempt > this.maxPillRetries) {
+            if (this.pillRetryExhausted.has(pillEl) || this.pillRetryFallbacks.has(pillEl)) return;
+            this.pillRetryExhausted.add(pillEl);
+            const timeoutId = setTimeout(() => {
+                this.pillRetryFallbacks.delete(pillEl);
+                if (this.started && pillEl.isConnected && !this.domRoots.has(pillEl)) {
+                    // One delayed retry handles Discord's asynchronously attached
+                    // Fiber without creating an unbounded retry loop.
+                    this._injectIntoPill(pillEl, this.maxPillRetries + 1);
+                }
+            }, 500);
+            this.pillRetryFallbacks.set(pillEl, timeoutId);
+            return;
+        }
+
         if (this.pillRetryFrames.has(pillEl)) return;
         const frameId = requestAnimationFrame(() => {
             this.pillRetryFrames.delete(pillEl);
@@ -1135,6 +1275,7 @@ module.exports = class WhoReacted {
 
     _injectIntoPill(pillEl, retryAttempt = 0) {
         if (!pillEl) return;
+        if (retryAttempt === 0) this.pillRetryExhausted.delete(pillEl);
 
         if (retryAttempt === 0 && this.pillRetryFrames.has(pillEl)) return;
 

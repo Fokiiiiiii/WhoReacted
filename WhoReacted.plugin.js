@@ -469,12 +469,11 @@ module.exports = class WhoReacted {
     vertical-align: middle;
     flex-shrink: 0;
     margin-left: 5px;
-    padding: 2px 3px;
-    border-radius: 999px;
-    background-color: rgba(43, 45, 49, 0.94);
-    background-color: color-mix(in srgb, #2b2d31 92%, var(--background-secondary, #2b2d31));
-    border: 1px solid var(--background-modifier-accent);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+    padding: 0;
+    border-radius: 0;
+    background: transparent;
+    border: 0;
+    box-shadow: none;
     max-height: 100%;
     pointer-events: auto;
     cursor: default;
@@ -490,13 +489,6 @@ module.exports = class WhoReacted {
     overflow: visible !important;
 }
 
-.bd-who-reacted__pill:hover .bd-who-reacted__container,
-.bd-who-reacted__container:hover {
-    background-color: rgba(63, 65, 71, 0.96);
-    background-color: color-mix(in srgb, #3f4147 94%, var(--background-tertiary, #3f4147));
-    border-color: var(--interactive-muted);
-    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.24);
-}
 `;
         BdApi.DOM.addStyle(this.name, css);
     }
@@ -887,7 +879,7 @@ module.exports = class WhoReacted {
                 self._saveDiag(false);
                 return list;
             },
-            [hideByThreshold, channelId, messageId, emoji && emoji.name, emoji && emoji.id, type]
+            [hideByThreshold, channelId, messageId, emoji && emoji.name, emoji && emoji.id, type, count]
         );
 
         // Keep the last confirmed result beyond a single React root's
@@ -949,6 +941,21 @@ module.exports = class WhoReacted {
         return this._h(this.RootC, { message, emoji, count, type });
     }
 
+    _renderIntoExistingRoot(entry, message, emoji, count, type) {
+        if (!entry || !entry.container) return;
+
+        try {
+            const element = this._renderReactorsElement(message, emoji, count, type);
+            if (entry.root && typeof entry.root.render === "function") {
+                entry.root.render(element);
+            } else if (BdApi.ReactDOM && typeof BdApi.ReactDOM.render === "function") {
+                BdApi.ReactDOM.render(element, entry.container);
+            }
+        } catch (err) {
+            this._logError("Strategy B: failed to update reaction pill:", err);
+        }
+    }
+
     /* ------------------------------------------------------------------ *
      *  Strategy B: DOM injection via MutationObserver + fiber walk
      * ------------------------------------------------------------------ */
@@ -961,7 +968,13 @@ module.exports = class WhoReacted {
         }
 
         this.observer = new MutationObserver(this._onMutations);
-        this.observer.observe(root, { childList: true, subtree: true });
+        this.observer.observe(root, {
+            childList: true,
+            characterData: true,
+            attributes: true,
+            attributeFilter: ["aria-label", "data-list-item-id"],
+            subtree: true
+        });
 
         // Initial sweep is queued so startup mutations are coalesced into one pass.
         this._queueScanRoot(root);
@@ -1031,6 +1044,19 @@ module.exports = class WhoReacted {
             }
             for (const node of mutation.removedNodes) {
                 if (node instanceof HTMLElement) this._queueCleanupRoot(node);
+            }
+
+            const target = mutation.target;
+            const element = target && target.nodeType === 1
+                ? target
+                : target && target.parentElement;
+            if (!element || (element.closest && element.closest(".bd-who-reacted__container"))) continue;
+
+            const pill = element.closest
+                ? element.closest('button[class*="reaction"], [role="button"][class*="reaction"]')
+                : null;
+            if (pill && this._isReactionPillCandidate(pill)) {
+                this._queueScanRoot(pill);
             }
         }
     }
@@ -1154,7 +1180,10 @@ module.exports = class WhoReacted {
             return;
         }
 
-        if (existing && existing.reactionKey === reactionKey) return;
+        if (existing && existing.reactionKey === reactionKey) {
+            this._renderIntoExistingRoot(existing, props.message, props.emoji, props.count, props.type);
+            return;
+        }
         if (existing) {
             this._teardownDomEntry(existing);
             this.domRoots.delete(pillEl);

@@ -3,7 +3,7 @@
  * @author Fokiiiiiii (modernized rewrite), jaimeadf (original)
  * @authorId 0
  * @description Shows the avatars of the users who reacted next to each reaction pill on messages. Modernized rewrite of the original WhoReacted plugin (webpack+JSX build) to work with current Discord using resilient module discovery and DOM/MutationObserver injection, in a self-contained plain-JS build (no bundler, no ZeresPluginLibrary).
- * @version 1.0.2
+ * @version 1.0.3
  * @authorLink https://github.com/Fokiiiiiii
  * @source https://github.com/Fokiiiiiii/WhoReacted
  * @website https://github.com/Fokiiiiiii/WhoReacted

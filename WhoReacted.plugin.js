@@ -15,7 +15,6 @@ module.exports = class WhoReacted {
         this.meta = meta || {};
         this.name = "WhoReacted";
 
-        // ---- runtime state ----
         this.mods = {};
         this.settings = null;
         this.defaults = {
@@ -34,15 +33,15 @@ module.exports = class WhoReacted {
         this.listeners = new Set();
         this.maskIdCounter = 0;
 
-        this.strategy = null; // always "B" (DOM/MutationObserver injection)
+        this.strategy = null;
         this.observer = null;
-        this.domRoots = new Map(); // element -> {root, container}
+        this.domRoots = new Map();
         this.scanFrameId = null;
         this.pendingScanRoots = new Set();
         this.pendingCleanupRoots = new Set();
-        this.pillRetryFrames = new Map(); // element -> requestAnimationFrame id
+        this.pillRetryFrames = new Map();
         this.maxPillRetries = 2;
-        this.reactionUsersCache = new Map(); // reaction key -> {users, timestamp}
+        this.reactionUsersCache = new Map();
         this.reactionUsersCacheTtl = 10 * 1000;
         this.reactionUsersCacheMax = 100;
         this.reactionUsersCacheUserMax = 12;
@@ -52,9 +51,6 @@ module.exports = class WhoReacted {
 
         this.started = false;
 
-        // On-disk diagnostics. Persisted (throttled) to
-        // plugins/WhoReacted.config.json under the "diagnostics" key so it
-        // can be inspected from the filesystem without console access.
         this.diag = {
             pluginVersion: this.meta.version || null,
             bdVersion: null,
@@ -83,22 +79,13 @@ module.exports = class WhoReacted {
         this._lastDiagSave = 0;
         this._diagSaveTimer = null;
 
-        // Bind so they can be used as stable references for patches/listeners.
         this._onMutations = this._onMutations.bind(this);
 
-        // Stable component references, created ONCE so React sees the same
-        // component identity across renders (no remounting) and so hooks run
-        // inside real component boundaries — these must NEVER be invoked as
-        // plain function calls, always via createElement.
         this.ReactorC = (props) => this._Reactor(props);
         this.MaskedReactorC = (props) => this._MaskedReactor(props);
         this.ReactorsC = (props) => this._Reactors(props);
         this.RootC = (props) => this._WhoReactedReactors(props);
     }
-
-    /* ------------------------------------------------------------------ *
-     *  Lifecycle
-     * ------------------------------------------------------------------ */
 
     start() {
         if (this.started) return;
@@ -211,7 +198,7 @@ module.exports = class WhoReacted {
         this.reactionUsersCache.clear();
         this.mods = {};
         this.strategy = null;
-        try { this._saveDiag(true); } catch (err) { /* best effort */ }
+        try { this._saveDiag(true); } catch {}
     }
 
     getSettingsPanel() {
@@ -233,13 +220,6 @@ module.exports = class WhoReacted {
         }
     }
 
-    /* ------------------------------------------------------------------ *
-     *  Settings persistence + pub/sub
-     * ------------------------------------------------------------------ */
-
-    // Clamps/coerces settings loaded from disk to the ranges the settings
-    // panel actually allows, so a corrupted or hand-edited settings file
-    // can't push out-of-range values into rendering.
     _normalizeSettings(raw) {
         const s = Object.assign({}, this.defaults, raw && typeof raw === "object" ? raw : {});
         const clamp = (value, min, max, fallback) => {
@@ -337,16 +317,10 @@ module.exports = class WhoReacted {
         return () => this.listeners.delete(listener);
     }
 
-    /* ------------------------------------------------------------------ *
-     *  Diagnostics (persisted to WhoReacted.config.json)
-     * ------------------------------------------------------------------ */
-
-    // Logs to the console AND appends to diag.errors (last 10) so failures
-    // can be inspected from disk without console access.
     _logError(...parts) {
         try {
             BdApi.Logger.error(this.name, ...parts);
-        } catch (e) { /* never throw */ }
+        } catch {}
         try {
             const msg = parts.map(p => {
                 if (p instanceof Error) return p.message || String(p);
@@ -358,11 +332,9 @@ module.exports = class WhoReacted {
                 this.diag.errors.splice(0, this.diag.errors.length - 10);
             }
             this._saveDiag(false);
-        } catch (e) { /* never throw */ }
+        } catch {}
     }
 
-    // Throttled persist: at most one write every 2s; a trailing write is
-    // scheduled so the final state always lands on disk.
     _saveDiag(force) {
         try {
             const now = Date.now();
@@ -379,12 +351,8 @@ module.exports = class WhoReacted {
             this.diag.updates++;
             this.diag.lastUpdate = new Date().toISOString();
             BdApi.Data.save(this.name, "diagnostics", this.diag);
-        } catch (e) { /* never throw, never recurse into _logError */ }
+        } catch {}
     }
-
-    /* ------------------------------------------------------------------ *
-     *  Module resolution
-     * ------------------------------------------------------------------ */
 
     _resolveModules() {
         const api = typeof BdApi !== "undefined" ? BdApi : null;
@@ -542,10 +510,6 @@ module.exports = class WhoReacted {
         );
     }
 
-    /* ------------------------------------------------------------------ *
-     *  Styles
-     * ------------------------------------------------------------------ */
-
     _removeStyles() {
         try {
             if (typeof BdApi !== "undefined" && BdApi.DOM && typeof BdApi.DOM.removeStyle === "function") {
@@ -629,10 +593,6 @@ module.exports = class WhoReacted {
         }
     }
 
-    /* ------------------------------------------------------------------ *
-     *  React component tree (shared by both injection strategies)
-     * ------------------------------------------------------------------ */
-
     _h() {
         return BdApi.React.createElement.apply(BdApi.React, arguments);
     }
@@ -651,7 +611,7 @@ module.exports = class WhoReacted {
             } else if (user && user.id) {
                 defaultIndex = Number((BigInt(user.id) >> 22n) % 6n);
             }
-        } catch (err) { /* keep index 0 */ }
+        } catch {}
         return `https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`;
     }
 
@@ -664,7 +624,7 @@ module.exports = class WhoReacted {
             if (typeof user.getAvatarURL === "function") {
                 candidate = user.getAvatarURL(guildId, cdnSize, true);
             }
-        } catch (err) { /* try plain-user fallbacks */ }
+        } catch {}
 
         try {
             if (!candidate && typeof user.avatarURL === "function") {
@@ -672,7 +632,7 @@ module.exports = class WhoReacted {
             } else if (!candidate && typeof user.avatarURL === "string") {
                 candidate = user.avatarURL;
             }
-        } catch (err) { /* try hash fallback */ }
+        } catch {}
 
         if (!candidate && user.id && typeof user.avatar === "string" && user.avatar) {
             const extension = user.avatar.startsWith("a_") ? "gif" : "webp";
@@ -812,9 +772,6 @@ module.exports = class WhoReacted {
             `+${remaining}`
         );
 
-        // Store/user resolution can be temporarily empty even while the
-        // native pill still has a positive count. Never render an empty img
-        // placeholder in that state; keep the information as a count badge.
         if (userSummary.length === 0 && totalCount > 0) {
             return h("div", { className: "bd-who-reacted__reactors" }, [makeMoreBadge(totalCount)]);
         }
@@ -837,11 +794,6 @@ module.exports = class WhoReacted {
 
     _useSettings() {
         const self = this;
-        // Faux "store" for our settings emitter. IMPORTANT: always consumed
-        // via our OWN _manualUseStateFromStores — Discord's real
-        // useStateFromStores expects Flux stores (addReactChangeListener,
-        // getDispatchToken, ...) and would throw on this object. The alias
-        // methods below are defense in depth only.
         const fauxStore = this._settingsFauxStore || (this._settingsFauxStore = {
             addChangeListener: (cb) => self.listeners.add(cb),
             removeChangeListener: (cb) => self.listeners.delete(cb),
@@ -859,9 +811,6 @@ module.exports = class WhoReacted {
         return `${channelId || ""}:${messageId || ""}:${emoji && (emoji.id || emoji.name) || ""}:${type || 0}`;
     }
 
-    // message.reactions is a plain array on most builds, but some Discord
-    // versions expose a Collection-like object instead — normalize both
-    // shapes so callers never have to special-case it.
     _reactionsArray(message) {
         if (!message || !message.reactions) return [];
         if (Array.isArray(message.reactions)) return message.reactions;
@@ -918,7 +867,7 @@ module.exports = class WhoReacted {
                 const total = Number(match.count);
                 if (Number.isFinite(total) && total > 0) return total;
             }
-        } catch (err) { /* fall back to known user count */ }
+        } catch {}
 
         return Math.max(0, Number(knownUsersCount) || 0);
     }
@@ -949,9 +898,6 @@ module.exports = class WhoReacted {
         return entry.users;
     }
 
-    // Top level component rendered for every reaction pill, regardless of
-    // which injection strategy placed it. Encapsulates threshold logic,
-    // filters, live store subscriptions, and rendering.
     _readReactionUsers(channelId, messageId, emoji, type) {
         const ReactionStore = this.mods.ReactionStore;
         const UserStore = this.mods.UserStore;
@@ -1017,10 +963,6 @@ module.exports = class WhoReacted {
         const count = props.count;
         const type = props.type;
 
-        // RULES OF HOOKS: every hook below runs unconditionally, in the same
-        // order, on every render. All early-return conditions are evaluated
-        // only AFTER the last hook call.
-
         const [refreshRevision, setRefreshRevision] = React.useState(0);
         React.useEffect(() => self._subscribeReactionRefresh(() => {
             setRefreshRevision(revision => revision + 1);
@@ -1039,7 +981,7 @@ module.exports = class WhoReacted {
             if (message) {
                 channelId = typeof message.getChannelId === "function" ? message.getChannelId() : message.channel_id;
             }
-        } catch (err) { /* ignore */ }
+        } catch {}
 
         const messageId = message ? message.id : null;
         const hideByThreshold = self._exceedsReactionThresholds(message);
@@ -1060,23 +1002,11 @@ module.exports = class WhoReacted {
         );
         const rawUsers = Array.isArray(rawUsersState) ? rawUsersState : [];
 
-        // Keep the last confirmed result beyond a single React root's
-        // lifetime so Discord's virtualized pill replacement cannot flash
-        // the avatars away while MessageReactionsStore briefly reports empty.
         const reactionKey = self._reactionKey(channelId, messageId, emoji, type);
         if (rawUsers.length > 0) self._cacheReactionUsers(reactionKey, rawUsers);
         const stableRawUsers = rawUsers.length > 0 ? rawUsers : self._getCachedReactionUsers(reactionKey);
         const effectiveCount = self._effectiveReactionCount(message, emoji, type, count, stableRawUsers.length);
         self.diag.data.lastEffectiveCount = effectiveCount;
-
-        // Discord does NOT populate MessageReactionsStore until something
-        // requests the reactor list (normally hovering the reaction
-        // tooltip). No internal module could be identified that reliably
-        // triggers this fetch without risking a crash (see _resolveModules
-        // history), so until then this shows a "+N" count badge instead of
-        // avatars for reactions the store hasn't been asked about yet.
-
-        // ---- all hooks are done; conditions may return early from here ----
 
         if (!message || !emoji || hideByThreshold) {
             return null;
@@ -1088,7 +1018,7 @@ module.exports = class WhoReacted {
             try {
                 const currentUser = UserStore.getCurrentUser();
                 if (currentUser) users = users.filter(u => u && u.id !== currentUser.id);
-            } catch (err) { /* ignore */ }
+            } catch {}
         }
 
         if (settings.hideBots) {
@@ -1098,7 +1028,7 @@ module.exports = class WhoReacted {
         if (settings.hideBlocked && RelationshipStore) {
             try {
                 users = users.filter(u => u && !RelationshipStore.isBlocked(u.id));
-            } catch (err) { /* ignore */ }
+            } catch {}
         }
 
         return h(this.ReactorsC, {
@@ -1113,15 +1043,8 @@ module.exports = class WhoReacted {
     }
 
     _renderReactorsElement(message, emoji, count, type) {
-        // this.RootC is a stable reference created once in the constructor,
-        // so React preserves component state across re-renders instead of
-        // remounting a fresh anonymous component every time.
         return this._h(this.RootC, { message, emoji, count, type });
     }
-
-    /* ------------------------------------------------------------------ *
-     *  Strategy B: DOM injection via MutationObserver + fiber walk
-     * ------------------------------------------------------------------ */
 
     _startStrategyB() {
         if (typeof document === "undefined" || typeof MutationObserver !== "function") {
@@ -1231,7 +1154,7 @@ module.exports = class WhoReacted {
                     ? element
                     : element.closest && element.closest(pillSelector);
                 if (pill) this._queueScanRoot(pill);
-            } catch (err) { /* best effort */ }
+            } catch {}
         };
 
         for (const mutation of mutations || []) {
@@ -1440,15 +1363,12 @@ module.exports = class WhoReacted {
             this.diag.strategyB.renderErrors++;
             this._logError("Strategy B: failed to render into pill:", err);
             if (container) {
-                try { container.remove(); } catch (removeErr) { /* best effort */ }
+                try { container.remove(); } catch {}
             }
-            try { pillEl.classList.remove("bd-who-reacted__pill"); } catch (classErr) { /* best effort */ }
+            try { pillEl.classList.remove("bd-who-reacted__pill"); } catch {}
         }
     }
 
-    // Walks up from the pill's fiber collecting the prop KEYS at each level
-    // (values omitted) — enough to see the actual component prop shape from
-    // the saved diagnostics without console access.
     _sampleFiberPropKeys(fiber) {
         const samples = [];
         try {
@@ -1463,7 +1383,7 @@ module.exports = class WhoReacted {
                 node = node.return;
                 depth++;
             }
-        } catch (err) { /* best effort */ }
+        } catch {}
         return samples;
     }
 
@@ -1515,10 +1435,6 @@ module.exports = class WhoReacted {
 
         return null;
     }
-
-    /* ------------------------------------------------------------------ *
-     *  Settings panel
-     * ------------------------------------------------------------------ */
 
     _buildSettingsPanelViaBdApi() {
         const self = this;
@@ -1666,8 +1582,6 @@ module.exports = class WhoReacted {
         return BdApi.UI.buildSettingsPanel({
             settings: settingsSchema,
             onChange: (categoryOrId, idOrValue, maybeValue) => {
-                // Different BD versions call onChange with slightly different
-                // arities; handle both (id, value) and (category, id, value).
                 try {
                     if (maybeValue !== undefined) {
                         self.updateSetting(idOrValue, maybeValue);

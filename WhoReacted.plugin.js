@@ -1,527 +1,457 @@
 /**
  * @name WhoReacted
  * @author Fokiiiiiii (modernized rewrite), jaimeadf (original)
- * @authorId 0
- * @description Shows the avatars of the users who reacted next to each reaction pill on messages. Modernized rewrite of the original WhoReacted plugin (webpack+JSX build) to work with current Discord using resilient module discovery and DOM/MutationObserver injection, in a self-contained plain-JS build (no bundler, no ZeresPluginLibrary).
- * @version 1.0.4
+ * @description Shows the avatars of the people who reacted next to each reaction on a message.
+ * @version 1.1.0
  * @authorLink https://github.com/Fokiiiiiii
  * @source https://github.com/Fokiiiiiii/WhoReacted
  * @website https://github.com/Fokiiiiiii/WhoReacted
  * @updateUrl https://raw.githubusercontent.com/Fokiiiiiii/WhoReacted/main/WhoReacted.plugin.js
  */
 
-module.exports = class WhoReacted {
-    constructor(meta) {
-        this.meta = meta || {};
-        this.name = "WhoReacted";
+const PILL_SELECTOR = 'button[class*="reaction"], [role="button"][class*="reaction"]';
+const CONTAINER_CLASS = "bd-who-reacted__container";
+const PILL_CLASS = "bd-who-reacted__pill";
+const EMPTY_USERS = Object.freeze([]);
 
+const STRINGS = {
+    en: {
+        preview: "Preview",
+        avatars: "Avatars",
+        max: "Avatars per reaction",
+        avatarSize: "Size",
+        avatarOverlap: "Overlap",
+        avatarSpacing: "Gap",
+        people: "Hide",
+        hideSelf: "Yourself",
+        hideBots: "Bots",
+        hideBlocked: "Blocked users",
+        loading: "Loading",
+        autoFetch: "Load reactors automatically",
+        autoFetchNote: "Loads who reacted for the reactions on screen, one request at a time, so avatars show without hovering.",
+        thresholds: "Messages with many reactions",
+        emojiThreshold: "Kinds of emoji",
+        emojiThresholdNote: "Hide avatars on messages with more kinds of emoji than this.",
+        reactionsTotalThreshold: "Total reactions",
+        reactionsTotalThresholdNote: "Hide avatars on messages with more reactions in total than this.",
+        reactionsPerEmojiThreshold: "Reactions on one emoji",
+        reactionsPerEmojiThresholdNote: "Hide avatars when a single emoji has more reactions than this.",
+        off: "Off",
+        more: "{n} more",
+        startFailed: "WhoReacted could not start because Discord changed. See the console for details.",
+        viewFailed: "WhoReacted could not attach to the reactions."
+    },
+    ja: {
+        preview: "プレビュー",
+        avatars: "アバター",
+        max: "1つのリアクションに表示する数",
+        avatarSize: "サイズ",
+        avatarOverlap: "重なり",
+        avatarSpacing: "すき間",
+        people: "表示しない人",
+        hideSelf: "自分",
+        hideBots: "ボット",
+        hideBlocked: "ブロック中のユーザー",
+        loading: "読み込み",
+        autoFetch: "リアクションした人を自動で読み込む",
+        autoFetchNote: "画面に見えているリアクションだけを1件ずつ読み込み、マウスを乗せなくてもアバターを表示します。",
+        thresholds: "リアクションが多いメッセージ",
+        emojiThreshold: "絵文字の種類",
+        emojiThresholdNote: "絵文字の種類がこの数を超えるメッセージではアバターを表示しません。",
+        reactionsTotalThreshold: "リアクションの合計",
+        reactionsTotalThresholdNote: "リアクションの合計がこの数を超えるメッセージではアバターを表示しません。",
+        reactionsPerEmojiThreshold: "1つの絵文字のリアクション数",
+        reactionsPerEmojiThresholdNote: "1つの絵文字のリアクションがこの数を超えるとアバターを表示しません。",
+        off: "オフ",
+        more: "ほか{n}人",
+        startFailed: "Discordの変更によりWhoReactedを開始できませんでした。詳細はコンソールを確認してください。",
+        viewFailed: "WhoReactedをリアクションに組み込めませんでした。"
+    }
+};
+
+const sameUsers = (a, b) => a === b || (
+    Array.isArray(a) &&
+    Array.isArray(b) &&
+    a.length === b.length &&
+    a.every((user, index) => user === b[index])
+);
+
+module.exports = class WhoReacted {
+    constructor() {
+        this.name = "WhoReacted";
         this.mods = {};
         this.settings = null;
         this.defaults = {
             max: 6,
             avatarSize: 20,
-            avatarOverlap: 100 / 3,
-            avatarSpacing: 100 / 12,
+            avatarOverlap: 33,
+            avatarSpacing: 8,
             emojiThreshold: 10,
             reactionsTotalThreshold: 500,
             reactionsPerEmojiThreshold: 100,
             hideSelf: false,
             hideBots: false,
-            hideBlocked: false
+            hideBlocked: false,
+            autoFetch: true
         };
 
+        this.started = false;
         this.listeners = new Set();
-        this.maskIdCounter = 0;
+        this.persistTimer = null;
 
-        this.strategy = null;
         this.observer = null;
         this.domRoots = new Map();
         this.scanFrameId = null;
         this.pendingScanRoots = new Set();
-        this.pendingCleanupRoots = new Set();
+        this.pruneRequested = false;
         this.pillRetryFrames = new Map();
+        this.ignoredPills = new WeakSet();
         this.maxPillRetries = 2;
+
         this.reactionUsersCache = new Map();
-        this.reactionUsersCacheTtl = 10 * 1000;
         this.reactionUsersCacheMax = 100;
-        this.reactionUsersCacheUserMax = 12;
-        this.reactionRefreshInterval = 8000;
-        this.reactionRefreshListeners = new Set();
-        this.reactionRefreshTimer = null;
+        this.reactionUsersCacheUserMax = 20;
 
-        this.started = false;
-
-        this.diag = {
-            pluginVersion: this.meta.version || null,
-            bdVersion: null,
-            updates: 0,
-            lastUpdate: null,
-            strategy: null,
-            fallbacksUsed: [],
-            strategyB: {
-                pillsSeen: 0,
-                fiberPropsFound: 0,
-                fiberPropsMissing: 0,
-                rendersOk: 0,
-                renderErrors: 0,
-                sampleFiberPropKeys: null
-            },
-            data: {
-                getReactionsCalls: 0,
-                lastReactionsCount: -1,
-                reactionCacheHits: 0,
-                reactionCacheEntries: 0,
-                lastEffectiveCount: 0,
-                invalidUsersSkipped: 0
-            },
-            errors: []
-        };
-        this._lastDiagSave = 0;
-        this._diagSaveTimer = null;
+        this.fetchInterval = 300;
+        this.fetchedKeysMax = 500;
+        this.fetchedKeys = new Set();
+        this.fetchRequests = new Map();
+        this.fetchQueue = [];
+        this.fetchBusy = false;
+        this.fetchTimer = null;
+        this.fetchPausedUntil = 0;
+        this.fetchGeneration = 0;
+        this.fetchDisabled = false;
+        this.visibilityObserver = null;
 
         this._onMutations = this._onMutations.bind(this);
+        this._onConnectionOpen = this._onConnectionOpen.bind(this);
 
-        this.ReactorC = (props) => this._Reactor(props);
-        this.MaskedReactorC = (props) => this._MaskedReactor(props);
-        this.ReactorsC = (props) => this._Reactors(props);
-        this.RootC = (props) => this._WhoReactedReactors(props);
+        this.ReactorC = props => this._Reactor(props);
+        this.ReactorsC = props => this._Reactors(props);
+        this.RootC = props => this._WhoReactedReactors(props);
+        this.PreviewC = () => this._SettingsPreview();
     }
 
     start() {
         if (this.started) return;
 
-        const showFailure = (message) => {
-            try {
-                if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.showToast === "function") {
-                    BdApi.UI.showToast(message, { type: "error" });
-                }
-            } catch (err) {
-                this._logError("Failed to show startup error:", err);
-            }
-        };
-
         try {
             this._loadSettings();
-            this._injectStyles();
+            this._clearLegacyDiagnostics();
 
             if (!this._resolveModules()) {
-                this._removeStyles();
-                this._logError("Aborting start(): one or more critical modules could not be resolved.");
-                showFailure("WhoReacted: failed to initialize (missing modules). See console for details.");
+                this._showError(this._t("startFailed"));
                 return;
             }
 
+            this._injectStyles();
             this.started = true;
-            this.strategy = "B";
 
-            if (!this._startStrategyB()) {
-                this.started = false;
-                this.strategy = null;
-                this._removeStyles();
-                this._logError("Aborting start(): DOM/Fiber injection could not be initialized.");
-                showFailure("WhoReacted: failed to initialize the reaction view.");
+            if (!this._startObserver()) {
+                this.stop();
+                this._showError(this._t("viewFailed"));
                 return;
             }
 
-            try {
-                this.diag.bdVersion = (typeof BdApi !== "undefined" && BdApi.version) || null;
-                this.diag.strategy = this.strategy;
-                this._logStartupSummary();
-                this._saveDiag(true);
-            } catch (err) {
-                this._logError("Failed to record startup diagnostics:", err);
-            }
+            this._subscribeConnectionOpen();
+            BdApi.Logger.info(this.name, `Started. Automatic reactor loading is ${this._autoFetchAvailable() ? "available" : "unavailable"}.`);
         } catch (err) {
-            this.started = false;
             this._logError("Unexpected error during start():", err);
-            this._removeStyles();
-            showFailure(`WhoReacted: failed to start (${err && err.message ? err.message : err})`);
+            this.stop();
+            this._showError(this._t("startFailed"));
         }
     }
 
     stop() {
         this.started = false;
-        this._stopReactionRefresh();
+        this.fetchGeneration++;
 
-        try {
-            if (typeof BdApi !== "undefined" && BdApi.Patcher && typeof BdApi.Patcher.unpatchAll === "function") {
-                BdApi.Patcher.unpatchAll(this.name);
-            }
-        } catch (err) {
-            this._logError("Error while unpatching:", err);
-        }
-
-        try {
-            if (this.observer) this.observer.disconnect();
-        } catch (err) {
-            this._logError("Error disconnecting observer:", err);
-        }
+        if (this.observer) this.observer.disconnect();
         this.observer = null;
-        this.observedRoot = null;
+        if (this.visibilityObserver) this.visibilityObserver.disconnect();
+        this.visibilityObserver = null;
 
-        try {
-            if (this.scanFrameId !== null && typeof cancelAnimationFrame === "function") {
-                cancelAnimationFrame(this.scanFrameId);
-            }
-        } catch (err) {
-            this._logError("Error cancelling scan frame:", err);
-        }
+        if (this.scanFrameId !== null) cancelAnimationFrame(this.scanFrameId);
         this.scanFrameId = null;
         this.pendingScanRoots.clear();
-        this.pendingCleanupRoots.clear();
-
-        for (const [, entry] of Array.from(this.domRoots.entries())) {
-            this._teardownDomEntry(entry);
-        }
-        this.domRoots.clear();
-
-        for (const frameId of this.pillRetryFrames.values()) {
-            try {
-                if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(frameId);
-            } catch (err) {
-                this._logError("Error cancelling pill retry:", err);
-            }
-        }
+        this.pruneRequested = false;
+        for (const frameId of this.pillRetryFrames.values()) cancelAnimationFrame(frameId);
         this.pillRetryFrames.clear();
 
-        try {
-            this._removeStyles();
-        } catch (err) {
-            this._logError("Error removing styles:", err);
-        }
+        if (this.fetchTimer !== null) clearTimeout(this.fetchTimer);
+        this.fetchTimer = null;
+        this.fetchQueue = [];
+        this.fetchRequests.clear();
+        this.fetchedKeys.clear();
+        this.fetchBusy = false;
+        this.fetchPausedUntil = 0;
+        this.fetchDisabled = false;
+        this._unsubscribeConnectionOpen();
 
-        if (this._diagSaveTimer) {
-            clearTimeout(this._diagSaveTimer);
-            this._diagSaveTimer = null;
-        }
+        for (const entry of this.domRoots.values()) this._teardownDomEntry(entry);
+        this.domRoots.clear();
 
+        if (this.persistTimer !== null) this._persistSettings();
+        this._removeStyles();
         this.reactionUsersCache.clear();
         this.mods = {};
-        this.strategy = null;
-        try { this._saveDiag(true); } catch {}
     }
 
     getSettingsPanel() {
         if (!this.settings) this._loadSettings();
+        const current = this.settings;
+        const t = key => this._t(key);
+        const off = { label: t("off"), value: 0 };
+        const slider = (id, min, max, step, markers, units, note) => ({
+            type: "slider", id, name: t(id), value: current[id], min, max, step, markers,
+            ...(units ? { units } : {}),
+            ...(note ? { note } : {})
+        });
+        const toggle = (id, note) => ({ type: "switch", id, name: t(id), value: current[id], ...(note ? { note } : {}) });
+        const category = (id, settings, collapsed) => ({
+            type: "category", id, name: t(id), collapsible: !!collapsed, shown: !collapsed, settings
+        });
 
-        try {
-            if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.buildSettingsPanel === "function") {
-                return this._buildSettingsPanelViaBdApi();
+        return BdApi.UI.buildSettingsPanel({
+            settings: [
+                { type: "custom", id: "preview", name: t("preview"), inline: false, children: this._h(this.PreviewC) },
+                category("avatars", [
+                    slider("max", 1, 20, 1, [1, 5, 10, 15, 20]),
+                    slider("avatarSize", 8, 48, 1, [8, 16, 24, 32, 40, 48], "px"),
+                    slider("avatarOverlap", 0, 100, 1, [0, 25, 50, 75, 100], "%"),
+                    slider("avatarSpacing", 0, 50, 1, [0, 10, 20, 30, 40, 50], "%")
+                ]),
+                category("people", [toggle("hideSelf"), toggle("hideBots"), toggle("hideBlocked")]),
+                category("loading", [toggle("autoFetch", t("autoFetchNote"))]),
+                category("thresholds", [
+                    slider("emojiThreshold", 0, 20, 1, [off, 5, 10, 15, 20], "", t("emojiThresholdNote")),
+                    slider("reactionsTotalThreshold", 0, 10000, 10, [off, 2500, 5000, 7500, 10000], "", t("reactionsTotalThresholdNote")),
+                    slider("reactionsPerEmojiThreshold", 0, 500, 5, [off, 100, 200, 300, 400, 500], "", t("reactionsPerEmojiThresholdNote"))
+                ], true)
+            ],
+            onChange: (categoryId, id, value) => this.updateSetting(id, value)
+        });
+    }
+
+    _t(key, vars) {
+        const locale = (document.documentElement && document.documentElement.lang) || navigator.language || "en";
+        const table = String(locale).toLowerCase().startsWith("ja") ? STRINGS.ja : STRINGS.en;
+        const text = table[key] || STRINGS.en[key] || key;
+        return vars ? text.replace(/\{(\w+)\}/g, (match, name) => String(vars[name] ?? "")) : text;
+    }
+
+    _SettingsPreview() {
+        const h = this._h.bind(this);
+        const settings = this._useSettings();
+        const currentUser = this.mods.UserStore ? this.mods.UserStore.getCurrentUser() : null;
+        const samples = Array.from({ length: 20 }, (_, index) => ({
+            id: `preview-${index}`,
+            discriminator: String((index % 5) + 1),
+            username: `${index + 1}`
+        }));
+        const users = currentUser ? [currentUser, ...samples.slice(1)] : samples;
+        const count = settings.max + 3;
+
+        return h("div", { className: "bd-who-reacted__preview" },
+            h("div", { className: "bd-who-reacted__preview-pill" },
+                h("span", { "aria-hidden": true }, "👍"),
+                h("span", null, String(count)),
+                h(this.ReactorsC, {
+                    count,
+                    users,
+                    max: settings.max,
+                    size: settings.avatarSize,
+                    overlap: settings.avatarOverlap / 100,
+                    spacing: settings.avatarSpacing / 100,
+                    guildId: null
+                })
+            )
+        );
+    }
+
+    updateSetting(id, value) {
+        if (!Object.prototype.hasOwnProperty.call(this.defaults, id)) return;
+        const current = this.settings || this.defaults;
+        const next = this._normalizeSettings({ ...current, [id]: value });
+        if (next[id] === current[id]) return;
+
+        this.settings = next;
+        this._schedulePersist();
+        if (!next.autoFetch) this._clearFetchQueue();
+        for (const listener of Array.from(this.listeners)) {
+            try {
+                listener();
+            } catch (err) {
+                this._logError("Settings listener threw:", err);
             }
-        } catch (err) {
-            this._logError("buildSettingsPanel failed, falling back to manual panel:", err);
-        }
-
-        try {
-            return this._buildFallbackSettingsPanel();
-        } catch (err) {
-            this._logError("Fallback settings panel failed:", err);
-            return null;
         }
     }
 
     _normalizeSettings(raw) {
-        const s = Object.assign({}, this.defaults, raw && typeof raw === "object" ? raw : {});
-        const clamp = (value, min, max, fallback) => {
-            const n = Number(value);
-            return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+        const source = raw && typeof raw === "object" ? raw : {};
+        const defaults = this.defaults;
+        const number = (key, min, max) => {
+            const value = Number(source[key]);
+            return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : defaults[key];
         };
-        const booleanValue = (value, fallback) => {
+        const boolean = key => {
+            const value = source[key];
             if (value === true || value === 1 || value === "1" || value === "true") return true;
-            if (value === false || value === 0 || value === "0" || value === "false" || value == null) return false;
-            return fallback;
+            if (value === false || value === 0 || value === "0" || value === "false") return false;
+            return defaults[key];
         };
 
-        s.max = clamp(s.max, 1, 20, this.defaults.max);
-        s.avatarSize = clamp(s.avatarSize, 8, 48, this.defaults.avatarSize);
-        s.avatarOverlap = clamp(s.avatarOverlap, 0, 100, this.defaults.avatarOverlap);
-        s.avatarSpacing = clamp(s.avatarSpacing, 0, 50, this.defaults.avatarSpacing);
-        s.emojiThreshold = clamp(s.emojiThreshold, 0, 20, this.defaults.emojiThreshold);
-        s.reactionsTotalThreshold = clamp(s.reactionsTotalThreshold, 0, 10000, this.defaults.reactionsTotalThreshold);
-        s.reactionsPerEmojiThreshold = clamp(s.reactionsPerEmojiThreshold, 0, 500, this.defaults.reactionsPerEmojiThreshold);
-        s.hideSelf = booleanValue(s.hideSelf, this.defaults.hideSelf);
-        s.hideBots = booleanValue(s.hideBots, this.defaults.hideBots);
-        s.hideBlocked = booleanValue(s.hideBlocked, this.defaults.hideBlocked);
-
-        return s;
+        return {
+            max: number("max", 1, 20),
+            avatarSize: number("avatarSize", 8, 48),
+            avatarOverlap: number("avatarOverlap", 0, 100),
+            avatarSpacing: number("avatarSpacing", 0, 50),
+            emojiThreshold: number("emojiThreshold", 0, 20),
+            reactionsTotalThreshold: number("reactionsTotalThreshold", 0, 10000),
+            reactionsPerEmojiThreshold: number("reactionsPerEmojiThreshold", 0, 500),
+            hideSelf: boolean("hideSelf"),
+            hideBots: boolean("hideBots"),
+            hideBlocked: boolean("hideBlocked"),
+            autoFetch: boolean("autoFetch")
+        };
     }
 
     _loadSettings() {
         let saved = null;
         try {
-            if (typeof BdApi !== "undefined" && BdApi.Data && typeof BdApi.Data.load === "function") {
-                saved = BdApi.Data.load(this.name, "settings");
-            }
+            saved = BdApi.Data.load(this.name, "settings");
         } catch (err) {
             this._logError("Failed to load settings:", err);
         }
         this.settings = this._normalizeSettings(saved);
     }
 
-    _saveSettings() {
+    _schedulePersist() {
+        if (this.persistTimer !== null) clearTimeout(this.persistTimer);
+        this.persistTimer = setTimeout(() => this._persistSettings(), 300);
+    }
+
+    _persistSettings() {
+        if (this.persistTimer !== null) clearTimeout(this.persistTimer);
+        this.persistTimer = null;
         try {
-            if (typeof BdApi !== "undefined" && BdApi.Data && typeof BdApi.Data.save === "function") {
-                BdApi.Data.save(this.name, "settings", this.settings);
-            }
+            BdApi.Data.save(this.name, "settings", this.settings);
         } catch (err) {
             this._logError("Failed to save settings:", err);
         }
     }
 
-    updateSetting(name, value) {
-        if (!Object.prototype.hasOwnProperty.call(this.defaults, name)) return;
-        const next = Object.assign({}, this.settings || this.defaults, { [name]: value });
-        this.settings = this._normalizeSettings(next);
-        this._saveSettings();
-        this._notifyListeners();
-    }
-
-    _notifyListeners() {
-        for (const listener of this.listeners) {
-            try { listener(); } catch (err) { this._logError("Settings listener threw:", err); }
+    _clearLegacyDiagnostics() {
+        try {
+            if (BdApi.Data.load(this.name, "diagnostics") !== undefined) {
+                BdApi.Data.delete(this.name, "diagnostics");
+            }
+        } catch (err) {
+            this._logError("Failed to remove legacy diagnostics:", err);
         }
-    }
-
-    _subscribeReactionRefresh(listener) {
-        if (typeof listener !== "function") return () => {};
-
-        this.reactionRefreshListeners.add(listener);
-        if (!this.reactionRefreshTimer && typeof setInterval === "function") {
-            this.reactionRefreshTimer = setInterval(() => {
-                for (const currentListener of Array.from(this.reactionRefreshListeners)) {
-                    try {
-                        currentListener();
-                    } catch (err) {
-                        this._logError("Reaction refresh listener threw:", err);
-                    }
-                }
-            }, this.reactionRefreshInterval);
-        }
-
-        return () => {
-            this.reactionRefreshListeners.delete(listener);
-            if (this.reactionRefreshListeners.size === 0) this._stopReactionRefresh();
-        };
-    }
-
-    _stopReactionRefresh() {
-        if (this.reactionRefreshTimer !== null && typeof clearInterval === "function") {
-            clearInterval(this.reactionRefreshTimer);
-        }
-        this.reactionRefreshTimer = null;
-        this.reactionRefreshListeners.clear();
-    }
-
-    subscribe(listener) {
-        this.listeners.add(listener);
-        return () => this.listeners.delete(listener);
     }
 
     _logError(...parts) {
         try {
             BdApi.Logger.error(this.name, ...parts);
         } catch {}
-        try {
-            const msg = parts.map(p => {
-                if (p instanceof Error) return p.message || String(p);
-                if (typeof p === "string") return p;
-                try { return JSON.stringify(p); } catch (e) { return String(p); }
-            }).join(" ").slice(0, 400);
-            this.diag.errors.push(msg);
-            if (this.diag.errors.length > 10) {
-                this.diag.errors.splice(0, this.diag.errors.length - 10);
-            }
-            this._saveDiag(false);
-        } catch {}
     }
 
-    _saveDiag(force) {
+    _showError(message) {
         try {
-            const now = Date.now();
-            if (!force && now - this._lastDiagSave < 2000) {
-                if (!this._diagSaveTimer) {
-                    this._diagSaveTimer = setTimeout(() => {
-                        this._diagSaveTimer = null;
-                        this._saveDiag(true);
-                    }, 2100);
-                }
-                return;
-            }
-            this._lastDiagSave = now;
-            this.diag.updates++;
-            this.diag.lastUpdate = new Date().toISOString();
-            BdApi.Data.save(this.name, "diagnostics", this.diag);
-        } catch {}
+            BdApi.UI.showToast(message, { type: "error" });
+        } catch (err) {
+            this._logError("Failed to show an error toast:", err);
+        }
     }
 
     _resolveModules() {
-        const api = typeof BdApi !== "undefined" ? BdApi : null;
-        const Webpack = api && api.Webpack;
-        const Filters = Webpack && Webpack.Filters;
+        const store = (name, methods) => {
+            let mod = null;
+            try {
+                mod = BdApi.Webpack.getStore(name);
+            } catch (err) {
+                this._logError(`getStore("${name}") threw:`, err);
+            }
+            return mod && methods.every(method => typeof mod[method] === "function") ? mod : null;
+        };
 
-        if (!Webpack || !Filters || typeof Webpack.getModule !== "function") {
-            this._logError("Discord Webpack API is unavailable.");
+        this.mods.ReactionStore = store("MessageReactionsStore", ["getReactions"]);
+        this.mods.UserStore = store("UserStore", ["getUser", "getCurrentUser"]);
+        this.mods.ChannelStore = store("ChannelStore", ["getChannel"]);
+        this.mods.MessageStore = store("MessageStore", ["getMessage"]);
+        this.mods.RelationshipStore = store("RelationshipStore", ["isBlocked"]);
+        this.mods.RestAPI = this._findModule(["get", "post", "put", "patch", "del"]);
+        this.mods.Dispatcher = this._findModule(["dispatch", "subscribe", "unsubscribe", "register"]);
+
+        const missing = ["ReactionStore", "UserStore", "ChannelStore"].filter(key => !this.mods[key]);
+        if (missing.length > 0) {
+            this._logError(`Failed to resolve ${missing.join(", ")}.`);
             return false;
         }
+        return true;
+    }
 
-        const fallbacksUsed = [];
-        let criticalMissing = false;
-
-        const getFilterByKeys = keys => {
-            try {
-                if (typeof Filters.byKeys === "function") return Filters.byKeys(...keys);
-                if (typeof Filters.byProps === "function") return Filters.byProps(...keys);
-            } catch (err) {
-                this._logError("Module filter failed:", err);
-            }
+    _findModule(methods) {
+        try {
+            return BdApi.Webpack.getModule(
+                mod => mod && typeof mod === "object" && methods.every(method => typeof mod[method] === "function"),
+                { searchExports: true }
+            ) || null;
+        } catch (err) {
+            this._logError(`Lookup for a module with ${methods.join("/")} threw:`, err);
             return null;
-        };
+        }
+    }
 
-        const resolveStore = (label, storeName, fallbackKeys, critical) => {
-            let mod = null;
-            let via = null;
-
-            try {
-                if (typeof Webpack.getStore === "function") {
-                    mod = Webpack.getStore(storeName);
-                    if (mod) via = "getStore";
-                }
-            } catch (err) {
-                this._logError(`getStore("${storeName}") threw:`, err);
-            }
-
-            if (!mod) {
-                try {
-                    const filter = getFilterByKeys(fallbackKeys);
-                    if (filter) {
-                        mod = Webpack.getModule(filter);
-                        if (mod) via = `key fallback (${fallbackKeys.join(",")})`;
-                    }
-                } catch (err) {
-                    this._logError(`Module lookup for ${label} threw:`, err);
-                }
-            }
-
-            const valid = mod && fallbackKeys.some(key => typeof mod[key] === "function");
-            if (!valid) {
-                this._logError(`Failed to resolve ${label}.`);
-                if (critical) criticalMissing = true;
-                return null;
-            }
-
-            if (via && via !== "getStore") fallbacksUsed.push(`${label} via ${via}`);
-            return mod;
-        };
-
-        this.mods.ReactionStore = resolveStore("ReactionStore", "MessageReactionsStore", ["getReactions"], true);
-        this.mods.UserStore = resolveStore("UserStore", "UserStore", ["getUser", "getCurrentUser"], true);
-        this.mods.ChannelStore = resolveStore("ChannelStore", "ChannelStore", ["getChannel"], true);
-        this.mods.RelationshipStore = resolveStore("RelationshipStore", "RelationshipStore", ["isBlocked"], false);
-
+    _subscribeConnectionOpen() {
+        const Dispatcher = this.mods.Dispatcher;
+        if (!Dispatcher) return;
         try {
-            const filter = typeof Filters.byStrings === "function"
-                ? Filters.byStrings("useStateFromStores")
-                : null;
-            const candidate = filter
-                ? Webpack.getModule(filter, { searchExports: true })
-                : null;
-            this.mods.useStateFromStores = typeof candidate === "function"
-                ? candidate
-                : (candidate && typeof candidate.default === "function" ? candidate.default : null);
+            Dispatcher.subscribe("CONNECTION_OPEN", this._onConnectionOpen);
         } catch (err) {
-            this._logError("Lookup of useStateFromStores threw:", err);
-            this.mods.useStateFromStores = null;
+            this._logError("Failed to subscribe to CONNECTION_OPEN:", err);
         }
-
-        if (!this.mods.useStateFromStores) {
-            fallbacksUsed.push("useStateFromStores via manual Flux subscription hook");
-            this.mods.useStateFromStores = this._manualUseStateFromStores.bind(this);
-        }
-
-        this._fallbacksUsed = fallbacksUsed;
-        this.diag.fallbacksUsed = fallbacksUsed;
-        return !criticalMissing;
     }
 
-    _manualUseStateFromStores(stores, getState, deps, refreshKey) {
-        const React = BdApi.React;
-        const [state, setState] = React.useState(() => {
-            try { return getState(); } catch (err) { return null; }
-        });
-        const readState = () => {
-            try {
-                setState(getState());
-            } catch (err) {
-                this._logError("Store selector threw:", err);
-            }
-        };
-
-        React.useEffect(() => {
-            let disposed = false;
-            const onChange = () => {
-                if (disposed) return;
-                readState();
-            };
-
-            const cleanups = [];
-            for (const store of Array.isArray(stores) ? stores : []) {
-                if (!store) continue;
-
-                const pairs = [
-                    ["addChangeListener", "removeChangeListener"],
-                    ["addReactChangeListener", "removeReactChangeListener"]
-                ];
-                for (const [addName, removeName] of pairs) {
-                    if (typeof store[addName] !== "function" || typeof store[removeName] !== "function") continue;
-                    try {
-                        store[addName](onChange);
-                        cleanups.push(() => store[removeName](onChange));
-                        break;
-                    } catch (err) {
-                        this._logError(`Failed to subscribe to ${addName}:`, err);
-                    }
-                }
-            }
-
-            onChange();
-            return () => {
-                disposed = true;
-                for (const cleanup of cleanups) {
-                    try { cleanup(); } catch (err) { this._logError("Failed to unsubscribe store:", err); }
-                }
-            };
-        }, Array.isArray(deps) ? deps : []);
-
-        React.useEffect(() => {
-            if (refreshKey === undefined) return;
-            readState();
-        }, [refreshKey]);
-
-        return state;
-    }
-
-    _logStartupSummary() {
-        const fb = this._fallbacksUsed && this._fallbacksUsed.length
-            ? this._fallbacksUsed.join("; ")
-            : "none";
-        BdApi.Logger.info(
-            this.name,
-            `Startup summary — injection strategy: ${this.strategy}; module fallbacks used: ${fb}`
-        );
-    }
-
-    _removeStyles() {
+    _unsubscribeConnectionOpen() {
+        const Dispatcher = this.mods.Dispatcher;
+        if (!Dispatcher) return;
         try {
-            if (typeof BdApi !== "undefined" && BdApi.DOM && typeof BdApi.DOM.removeStyle === "function") {
-                BdApi.DOM.removeStyle(this.name);
-            }
+            Dispatcher.unsubscribe("CONNECTION_OPEN", this._onConnectionOpen);
         } catch (err) {
-            this._logError("Failed to remove styles:", err);
+            this._logError("Failed to unsubscribe from CONNECTION_OPEN:", err);
         }
+    }
+
+    _onConnectionOpen() {
+        this.fetchedKeys.clear();
+        this.fetchDisabled = false;
     }
 
     _injectStyles() {
-        const css = `
+        BdApi.DOM.addStyle(this.name, `
+.${CONTAINER_CLASS} {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    flex-shrink: 0;
+    margin-left: 4px;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    max-height: 100%;
+    pointer-events: auto;
+    cursor: default;
+}
+
+.${CONTAINER_CLASS}:empty {
+    display: none;
+}
+
 .bd-who-reacted__reactors {
     display: inline-flex;
     align-items: center;
@@ -533,19 +463,15 @@ module.exports = class WhoReacted {
     margin-left: 4px;
 }
 
-.bd-who-reacted__reactors > svg,
-.bd-who-reacted__reactors > img {
-    display: block;
-}
-
 .bd-who-reacted__reactor-avatar {
+    display: block;
+    flex-shrink: 0;
     box-sizing: border-box;
     border-radius: 50%;
     border: 1.5px solid var(--background-secondary);
     background-color: #2b2d31;
-    display: block;
-    opacity: 1 !important;
     object-fit: cover;
+    opacity: 1 !important;
 }
 
 .bd-who-reacted__more-reactors {
@@ -561,23 +487,7 @@ module.exports = class WhoReacted {
     text-shadow: 0 1px 1px rgba(0, 0, 0, 0.45);
 }
 
-.bd-who-reacted__container {
-    display: inline-flex;
-    align-items: center;
-    vertical-align: middle;
-    flex-shrink: 0;
-    margin-left: 4px;
-    padding: 0;
-    border-radius: 0;
-    background: transparent;
-    border: 0;
-    box-shadow: none;
-    max-height: 100%;
-    pointer-events: auto;
-    cursor: default;
-}
-
-.bd-who-reacted__pill {
+.${PILL_CLASS} {
     display: inline-flex !important;
     flex-direction: row !important;
     align-items: center !important;
@@ -586,15 +496,96 @@ module.exports = class WhoReacted {
     overflow: visible !important;
 }
 
+.bd-who-reacted__preview {
+    display: flex;
+    align-items: center;
+    min-height: 56px;
+    padding: 4px 0 8px;
+}
 
-`;
-        if (typeof BdApi !== "undefined" && BdApi.DOM && typeof BdApi.DOM.addStyle === "function") {
-            BdApi.DOM.addStyle(this.name, css);
+.bd-who-reacted__preview-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-radius: 8px;
+    border: 1px solid var(--border-faint, rgba(255, 255, 255, 0.08));
+    background: var(--background-secondary, #2b2d31);
+    color: var(--text-normal, #dbdee1);
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1;
+}
+`);
+    }
+
+    _removeStyles() {
+        try {
+            BdApi.DOM.removeStyle(this.name);
+        } catch (err) {
+            this._logError("Failed to remove styles:", err);
         }
     }
 
-    _h() {
-        return BdApi.React.createElement.apply(BdApi.React, arguments);
+    _h(...args) {
+        return BdApi.React.createElement(...args);
+    }
+
+    _useSettings() {
+        const React = BdApi.React;
+        const [, setRevision] = React.useState(0);
+        React.useEffect(() => {
+            const listener = () => setRevision(revision => revision + 1);
+            this.listeners.add(listener);
+            return () => {
+                this.listeners.delete(listener);
+            };
+        }, []);
+        return this.settings || this.defaults;
+    }
+
+    _useStoreState(stores, getState, deps, isEqual = Object.is) {
+        const React = BdApi.React;
+        const read = () => {
+            try {
+                return getState();
+            } catch (err) {
+                this._logError("Store selector threw:", err);
+                return undefined;
+            }
+        };
+        const [state, setState] = React.useState(read);
+        const current = React.useRef(state);
+
+        React.useEffect(() => {
+            let active = true;
+            const onChange = () => {
+                if (!active) return;
+                const next = read();
+                if (isEqual(current.current, next)) return;
+                current.current = next;
+                setState(next);
+            };
+
+            const cleanups = [];
+            for (const store of stores) {
+                if (!store) continue;
+                const [add, remove] = typeof store.addChangeListener === "function"
+                    ? ["addChangeListener", "removeChangeListener"]
+                    : ["addReactChangeListener", "removeReactChangeListener"];
+                if (typeof store[add] !== "function" || typeof store[remove] !== "function") continue;
+                store[add](onChange);
+                cleanups.push(() => store[remove](onChange));
+            }
+
+            onChange();
+            return () => {
+                active = false;
+                for (const cleanup of cleanups) cleanup();
+            };
+        }, deps);
+
+        return state;
     }
 
     _avatarSize(size) {
@@ -604,163 +595,97 @@ module.exports = class WhoReacted {
     }
 
     _defaultAvatarUrl(user) {
-        let defaultIndex = 0;
+        let index = 0;
         try {
             if (user && user.discriminator && user.discriminator !== "0") {
-                defaultIndex = Number(user.discriminator) % 5;
+                index = Number(user.discriminator) % 5;
             } else if (user && user.id) {
-                defaultIndex = Number((BigInt(user.id) >> 22n) % 6n);
+                index = Number((BigInt(user.id) >> 22n) % 6n);
             }
         } catch {}
-        return `https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`;
+        return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
     }
 
-    _normalizeAvatarUrl(user, guildId, size) {
-        if (!user) return null;
+    _avatarUrl(user, guildId, size) {
         const cdnSize = this._avatarSize(size);
-        let candidate = null;
+        let url = null;
 
         try {
-            if (typeof user.getAvatarURL === "function") {
-                candidate = user.getAvatarURL(guildId, cdnSize, true);
-            }
+            if (typeof user.getAvatarURL === "function") url = user.getAvatarURL(guildId, cdnSize, false);
         } catch {}
 
-        try {
-            if (!candidate && typeof user.avatarURL === "function") {
-                candidate = user.avatarURL({ size: cdnSize, extension: "webp" });
-            } else if (!candidate && typeof user.avatarURL === "string") {
-                candidate = user.avatarURL;
-            }
-        } catch {}
-
-        if (!candidate && user.id && typeof user.avatar === "string" && user.avatar) {
-            const extension = user.avatar.startsWith("a_") ? "gif" : "webp";
-            candidate = `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.${extension}?size=${cdnSize}`;
+        if (!url && user.id && typeof user.avatar === "string" && user.avatar) {
+            url = `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.webp?size=${cdnSize}`;
         }
+        if (!url) return this._defaultAvatarUrl(user);
 
-        if (!candidate) {
-            candidate = this._defaultAvatarUrl(user);
-        }
-
-        try {
-            const url = String(candidate);
-            if (url.startsWith("//")) return `https:${url}`;
-            if (url.startsWith("/")) return `https://cdn.discordapp.com${url}`;
-            return url;
-        } catch (err) {
-            return null;
-        }
+        url = String(url);
+        if (url.startsWith("//")) return `https:${url}`;
+        if (url.startsWith("/")) return `https://cdn.discordapp.com${url}`;
+        return url;
     }
 
     _userLabel(user) {
-        if (!user) return "Unknown user";
         return String(user.globalName || user.global_name || user.displayName || user.username || user.tag || user.id || "Unknown user");
     }
 
-    _Reactor(props) {
-        const h = this._h.bind(this);
-        const user = props.user;
-        const size = props.size;
-        const guildId = props.guildId;
+    _avatarMask(size, overlap, spacing) {
+        const round = value => Math.round(value * 100) / 100;
+        const radius = round((0.5 + spacing) * size);
+        const centerX = round((1.5 + spacing - overlap) * size);
+        const image = `radial-gradient(circle ${radius}px at ${centerX}px 50%, transparent ${round(Math.max(0, radius - 0.5))}px, #000 ${radius}px)`;
+        return { offset: round((overlap - spacing) * size), image };
+    }
 
-        const src = this._normalizeAvatarUrl(user, guildId, size);
-        const fallbackSrc = this._defaultAvatarUrl(user);
+    _Reactor(props) {
+        const { user, size, guildId, mask } = props;
+        const fallback = this._defaultAvatarUrl(user);
         const label = this._userLabel(user);
 
-        return h("img", {
+        return this._h("img", {
             className: "bd-who-reacted__reactor-avatar",
             width: size,
             height: size,
-            src: src || undefined,
+            src: this._avatarUrl(user, guildId, size),
             title: label,
             "aria-label": label,
             alt: "",
+            loading: "lazy",
+            decoding: "async",
             draggable: false,
+            style: mask
+                ? { marginRight: `${-mask.offset}px`, WebkitMaskImage: mask.image, maskImage: mask.image }
+                : undefined,
             onError: event => {
-                const img = event.currentTarget;
-                if (img && img.src !== fallbackSrc) img.src = fallbackSrc;
+                const image = event.currentTarget;
+                if (image && image.src !== fallback) image.src = fallback;
             }
         });
     }
 
-    _useUniqueMaskId() {
-        const React = BdApi.React;
-        if (typeof React.useId === "function") {
-            return "bd-who-reacted-mask-" + String(React.useId()).replace(/[^a-zA-Z0-9_-]/g, "");
-        }
-        const ref = React.useRef(null);
-        if (ref.current === null) {
-            ref.current = "bd-who-reacted-mask-" + (this.maskIdCounter++);
-        }
-        return ref.current;
-    }
-
-    _MaskedReactor(props) {
-        const h = this._h.bind(this);
-        const size = props.size;
-        const overlap = props.overlap;
-        const spacing = props.spacing;
-
-        const proportionalInnerRadius = 1 / 2;
-        const proportionalOuterRadius = proportionalInnerRadius + spacing;
-        const absoluteOffset = (overlap - spacing) * size;
-
-        const maskId = this._useUniqueMaskId();
-
-        return h(
-            "svg",
-            { style: { marginRight: `${-absoluteOffset}px` }, width: size, height: size },
-            h(
-                "defs",
-                null,
-                h(
-                    "mask",
-                    { id: maskId, maskContentUnits: "objectBoundingBox", viewBox: "0 0 1 1" },
-                    h("rect", { fill: "white", width: "1", height: "1" }),
-                    h("circle", {
-                        fill: "black",
-                        cx: 2 * proportionalInnerRadius + proportionalOuterRadius - overlap,
-                        cy: "0.5",
-                        r: proportionalOuterRadius
-                    })
-                )
-            ),
-            h(
-                "foreignObject",
-                { width: "100%", height: "100%", mask: `url(#${maskId})` },
-                h(this.ReactorC, { size, user: props.user, guildId: props.guildId })
-            )
-        );
-    }
-
     _Reactors(props) {
         const h = this._h.bind(this);
-        const count = props.count;
-        const users = props.users || [];
-        const max = props.max;
-        const size = props.size;
-        const overlap = props.overlap;
-        const spacing = props.spacing;
-        const channel = props.channel;
-        const guildId = channel && channel.guild_id;
+        const { containerRef, users, size, guildId } = props;
+        const total = Math.max(0, Number(props.count) || 0);
+        const shown = users.slice(0, Math.min(props.max, total));
+        const remaining = total - shown.length;
+        const mask = shown.length > 1 ? this._avatarMask(size, props.overlap, props.spacing) : null;
 
-        const validUsers = users.filter(user => user && typeof user === "object" && (
-            user.id || user.username || user.globalName || user.global_name || user.avatar || user.avatarURL || user.getAvatarURL
-        ));
-        this.diag.data.invalidUsersSkipped += users.length - validUsers.length;
-        const totalCount = Math.max(0, Number(count) || 0);
-        const usersShown = Math.min(max, validUsers.length, totalCount);
-        const hasMoreUsers = totalCount > usersShown;
-        const userSummary = validUsers.slice(0, usersShown);
+        const children = shown.map((user, index) => h(this.ReactorC, {
+            key: user.id,
+            user,
+            size,
+            guildId,
+            mask: index < shown.length - 1 ? mask : null
+        }));
 
-        const makeMoreBadge = remaining => h(
-            "div",
-            {
+        if (remaining > 0) {
+            const label = this._t("more", { n: remaining });
+            children.push(h("div", {
                 key: "more",
                 className: "bd-who-reacted__more-reactors",
-                title: `${remaining} more reactor${remaining === 1 ? "" : "s"}`,
-                "aria-label": `${remaining} more reactor${remaining === 1 ? "" : "s"}`,
+                title: label,
+                "aria-label": label,
                 style: {
                     height: `${size}px`,
                     minWidth: `${size}px`,
@@ -768,43 +693,11 @@ module.exports = class WhoReacted {
                     borderRadius: `${size / 2}px`,
                     fontSize: `${Math.max(9, size * 0.44)}px`
                 }
-            },
-            `+${remaining}`
-        );
-
-        if (userSummary.length === 0 && totalCount > 0) {
-            return h("div", { className: "bd-who-reacted__reactors" }, [makeMoreBadge(totalCount)]);
-        }
-
-        const children = userSummary.map((user, index) => {
-            const isLast = index === usersShown - 1;
-            return isLast
-                ? h(this.ReactorC, { key: user.id || index, size, user, guildId })
-                : h(this.MaskedReactorC, { key: user.id || index, size, user, guildId, overlap, spacing });
-        });
-
-        if (hasMoreUsers) {
-            children.push(makeMoreBadge(totalCount - usersShown));
+            }, `+${remaining}`));
         }
 
         if (children.length === 0) return null;
-
-        return h("div", { className: "bd-who-reacted__reactors" }, children);
-    }
-
-    _useSettings() {
-        const self = this;
-        const fauxStore = this._settingsFauxStore || (this._settingsFauxStore = {
-            addChangeListener: (cb) => self.listeners.add(cb),
-            removeChangeListener: (cb) => self.listeners.delete(cb),
-            addReactChangeListener: (cb) => self.listeners.add(cb),
-            removeReactChangeListener: (cb) => self.listeners.delete(cb)
-        });
-
-        return this._manualUseStateFromStores([fauxStore], () => ({
-            settings: self.settings,
-            defaults: self.defaults
-        }), []);
+        return h("div", { className: "bd-who-reacted__reactors", ref: containerRef }, children);
     }
 
     _reactionKey(channelId, messageId, emoji, type) {
@@ -815,22 +708,17 @@ module.exports = class WhoReacted {
         if (!message || !message.reactions) return [];
         if (Array.isArray(message.reactions)) return message.reactions;
         if (typeof message.reactions.toArray !== "function") return [];
-
         try {
             const reactions = message.reactions.toArray();
             return Array.isArray(reactions) ? reactions : [];
-        } catch (err) {
+        } catch {
             return [];
         }
     }
 
-    _exceedsReactionThresholds(message) {
-        const settings = this.settings || this.defaults;
+    _exceedsReactionThresholds(message, settings) {
         const reactions = this._reactionsArray(message);
-
-        if (settings.emojiThreshold && reactions.length > settings.emojiThreshold) {
-            return true;
-        }
+        if (settings.emojiThreshold && reactions.length > settings.emojiThreshold) return true;
 
         if (settings.reactionsTotalThreshold) {
             const total = reactions.reduce((sum, reaction) => sum + (reaction && reaction.count ? reaction.count : 0), 0);
@@ -838,832 +726,492 @@ module.exports = class WhoReacted {
         }
 
         if (settings.reactionsPerEmojiThreshold) {
-            for (const reaction of reactions) {
-                if (reaction && reaction.count > settings.reactionsPerEmojiThreshold) return true;
-            }
+            return reactions.some(reaction => reaction && reaction.count > settings.reactionsPerEmojiThreshold);
         }
-
         return false;
     }
 
-    _effectiveReactionCount(message, emoji, type, suppliedCount, knownUsersCount) {
-        const direct = Number(suppliedCount);
-        if (Number.isFinite(direct) && direct > 0) return direct;
+    _reactionCount(message, emoji, type) {
+        const match = this._reactionsArray(message).find(reaction => {
+            const other = reaction && reaction.emoji;
+            if (!other) return false;
+            if (emoji.id || other.id) return String(emoji.id || "") === String(other.id || "");
+            return String(emoji.name || "") === String(other.name || "");
+        });
+        if (!match) return null;
 
-        try {
-            const reactions = this._reactionsArray(message);
-            const match = reactions.find(reaction => {
-                const reactionEmoji = reaction && reaction.emoji;
-                if (!reactionEmoji || !emoji) return false;
-                if (emoji.id || reactionEmoji.id) return String(emoji.id || "") === String(reactionEmoji.id || "");
-                return String(emoji.name || "") === String(reactionEmoji.name || "");
-            });
-            if (match) {
-                const details = match.count_details || match.countDetails;
-                const typed = Number(type) === 1
-                    ? Number(details && (details.burst ?? details.super))
-                    : Number(details && details.normal);
-                if (Number.isFinite(typed) && typed > 0) return typed;
-                const total = Number(match.count);
-                if (Number.isFinite(total) && total > 0) return total;
-            }
-        } catch {}
+        const details = match.count_details || match.countDetails;
+        const typed = Number(type) === 1
+            ? Number(details && (details.burst ?? details.super))
+            : Number(details && details.normal);
+        if (Number.isFinite(typed) && typed > 0) return typed;
 
-        return Math.max(0, Number(knownUsersCount) || 0);
+        const total = Number(match.count);
+        return Number.isFinite(total) ? Math.max(0, total) : null;
     }
 
-    _cacheReactionUsers(key, users) {
-        if (!key || !Array.isArray(users) || users.length === 0) return;
-        this.reactionUsersCache.delete(key);
-        const userLimit = Math.max(1, Math.min(
-            this.reactionUsersCacheUserMax,
-            Number(this.settings?.max) || this.defaults.max
-        ));
-        this.reactionUsersCache.set(key, { users: users.slice(0, userLimit), timestamp: Date.now() });
-        while (this.reactionUsersCache.size > this.reactionUsersCacheMax) {
-            this.reactionUsersCache.delete(this.reactionUsersCache.keys().next().value);
-        }
-        this.diag.data.reactionCacheEntries = this.reactionUsersCache.size;
-    }
-
-    _getCachedReactionUsers(key) {
-        const entry = this.reactionUsersCache.get(key);
-        if (!entry) return [];
-        if (Date.now() - entry.timestamp > this.reactionUsersCacheTtl) {
-            this.reactionUsersCache.delete(key);
-            this.diag.data.reactionCacheEntries = this.reactionUsersCache.size;
-            return [];
-        }
-        this.diag.data.reactionCacheHits++;
-        return entry.users;
-    }
-
-    _readReactionUsers(channelId, messageId, emoji, type) {
-        const ReactionStore = this.mods.ReactionStore;
-        const UserStore = this.mods.UserStore;
-        if (
-            !ReactionStore ||
-            typeof ReactionStore.getReactions !== "function" ||
-            !UserStore ||
-            typeof UserStore.getUser !== "function" ||
-            !channelId ||
-            !messageId ||
-            !emoji
-        ) return [];
-
+    _readReactionUsers(channelId, messageId, emoji, type, limit) {
+        const { ReactionStore, UserStore } = this.mods;
         let reactions = null;
         try {
-            reactions = ReactionStore.getReactions(channelId, messageId, emoji, 100, type) || {};
+            reactions = ReactionStore.getReactions(channelId, messageId, emoji, 100, type);
         } catch (err) {
             this._logError("ReactionStore.getReactions threw:", err);
-            return [];
+            return EMPTY_USERS;
         }
+        if (!reactions) return EMPTY_USERS;
 
         const users = [];
         const seen = new Set();
-        const addUser = (id, value) => {
+        const add = (id, value) => {
+            if (users.length >= limit) return;
             let user = value && typeof value === "object" && value.id ? value : null;
             if (!user) {
-                try { user = UserStore.getUser(id); } catch (err) { user = null; }
+                try {
+                    user = UserStore.getUser(id);
+                } catch {
+                    user = null;
+                }
             }
             if (!user || !user.id || seen.has(user.id)) return;
             seen.add(user.id);
             users.push(user);
         };
 
-        try {
-            if (reactions instanceof Map) {
-                for (const [id, value] of reactions.entries()) addUser(id, value);
-            } else if (Array.isArray(reactions)) {
-                for (const value of reactions) addUser(typeof value === "string" ? value : value && value.id, value);
-            } else if (reactions && typeof reactions === "object") {
-                for (const [id, value] of Object.entries(reactions)) addUser(id, value);
-            }
-        } catch (err) {
-            this._logError("Failed to normalize reaction users:", err);
+        if (reactions instanceof Map) {
+            for (const [id, value] of reactions) add(id, value);
+        } else if (Array.isArray(reactions)) {
+            for (const value of reactions) add(typeof value === "string" ? value : value && value.id, value);
+        } else if (typeof reactions === "object") {
+            for (const [id, value] of Object.entries(reactions)) add(id, value);
         }
 
-        const maxUsers = Math.max(
-            1,
-            Math.min(50, Number(this.settings?.max) || this.defaults.max)
-        );
-        const result = users.slice(0, maxUsers);
-        this.diag.data.getReactionsCalls++;
-        this.diag.data.lastReactionsCount = result.length;
-        this._saveDiag(false);
-        return result;
+        return users.length > 0 ? users : EMPTY_USERS;
+    }
+
+    _cacheReactionUsers(key, users) {
+        this.reactionUsersCache.delete(key);
+        this.reactionUsersCache.set(key, users.slice(0, this.reactionUsersCacheUserMax));
+        if (this.reactionUsersCache.size > this.reactionUsersCacheMax) {
+            this.reactionUsersCache.delete(this.reactionUsersCache.keys().next().value);
+        }
+    }
+
+    _getCachedReactionUsers(key) {
+        return this.reactionUsersCache.get(key) || EMPTY_USERS;
+    }
+
+    _filterUsers(users, settings) {
+        const { UserStore, RelationshipStore } = this.mods;
+        try {
+            let result = users;
+            if (settings.hideSelf) {
+                const currentUser = UserStore.getCurrentUser();
+                if (currentUser) result = result.filter(user => user.id !== currentUser.id);
+            }
+            if (settings.hideBots) result = result.filter(user => !user.bot);
+            if (settings.hideBlocked && RelationshipStore) result = result.filter(user => !RelationshipStore.isBlocked(user.id));
+            return result;
+        } catch (err) {
+            this._logError("Failed to filter reactors:", err);
+            return users;
+        }
     }
 
     _WhoReactedReactors(props) {
-        const self = this;
-        const h = this._h.bind(this);
         const React = BdApi.React;
-        const message = props.message;
-        const emoji = props.emoji;
-        const count = props.count;
-        const type = props.type;
+        const { channelId, messageId, emoji, type, fallbackMessage, fallbackCount } = props;
+        const { ChannelStore, MessageStore, ReactionStore } = this.mods;
+        const settings = this._useSettings();
+        const containerRef = React.useRef(null);
 
-        const [refreshRevision, setRefreshRevision] = React.useState(0);
-        React.useEffect(() => self._subscribeReactionRefresh(() => {
-            setRefreshRevision(revision => revision + 1);
-        }), []);
-
-        const { settings } = this._useSettings();
-
-        const ChannelStore = this.mods.ChannelStore;
-        const ReactionStore = this.mods.ReactionStore;
-        const UserStore = this.mods.UserStore;
-        const RelationshipStore = this.mods.RelationshipStore;
-        const useStateFromStores = this.mods.useStateFromStores;
-
-        let channelId = null;
-        try {
-            if (message) {
-                channelId = typeof message.getChannelId === "function" ? message.getChannelId() : message.channel_id;
-            }
-        } catch {}
-
-        const messageId = message ? message.id : null;
-        const hideByThreshold = self._exceedsReactionThresholds(message);
-
-        const channel = useStateFromStores(
-            [ChannelStore],
-            () => {
-                try { return channelId ? ChannelStore.getChannel(channelId) : null; } catch (err) { return null; }
-            },
-            [channelId]
+        const message = this._useStoreState(
+            MessageStore ? [MessageStore] : [],
+            () => (MessageStore && MessageStore.getMessage(channelId, messageId)) || fallbackMessage,
+            [channelId, messageId, fallbackMessage]
         );
+        const channel = this._useStoreState([ChannelStore], () => ChannelStore.getChannel(channelId), [channelId]);
 
-        const rawUsersState = self._manualUseStateFromStores(
+        const hidden = this._exceedsReactionThresholds(message, settings);
+        const readLimit = Math.min(100, settings.max * 2);
+        const storeUsers = this._useStoreState(
             [ReactionStore],
-            () => hideByThreshold ? [] : self._readReactionUsers(channelId, messageId, emoji, type),
-            [hideByThreshold, channelId, messageId, emoji && emoji.name, emoji && emoji.id, type],
-            refreshRevision
-        );
-        const rawUsers = Array.isArray(rawUsersState) ? rawUsersState : [];
+            () => (hidden ? EMPTY_USERS : this._readReactionUsers(channelId, messageId, emoji, type, readLimit)),
+            [hidden, channelId, messageId, emoji.id, emoji.name, type, readLimit],
+            sameUsers
+        ) || EMPTY_USERS;
 
-        const reactionKey = self._reactionKey(channelId, messageId, emoji, type);
-        if (rawUsers.length > 0) self._cacheReactionUsers(reactionKey, rawUsers);
-        const stableRawUsers = rawUsers.length > 0 ? rawUsers : self._getCachedReactionUsers(reactionKey);
-        const effectiveCount = self._effectiveReactionCount(message, emoji, type, count, stableRawUsers.length);
-        self.diag.data.lastEffectiveCount = effectiveCount;
+        const reactionKey = this._reactionKey(channelId, messageId, emoji, type);
+        const matchedCount = this._reactionCount(message, emoji, type);
+        const count = matchedCount === null ? Math.max(0, Number(fallbackCount) || 0) : matchedCount;
+        const needsFetch = settings.autoFetch && !hidden && count > 0 && storeUsers.length < Math.min(count, settings.max);
 
-        if (!message || !emoji || hideByThreshold) {
-            return null;
-        }
+        React.useEffect(() => {
+            if (storeUsers.length > 0) this._cacheReactionUsers(reactionKey, storeUsers);
+        }, [reactionKey, storeUsers]);
 
-        let users = stableRawUsers;
+        React.useEffect(() => {
+            const element = containerRef.current;
+            if (!needsFetch || !element) return undefined;
+            return this._requestReactors(element, { key: reactionKey, channelId, messageId, emoji, type });
+        }, [needsFetch, reactionKey]);
 
-        if (settings.hideSelf && UserStore) {
-            try {
-                const currentUser = UserStore.getCurrentUser();
-                if (currentUser) users = users.filter(u => u && u.id !== currentUser.id);
-            } catch {}
-        }
+        if (hidden || count <= 0) return null;
 
-        if (settings.hideBots) {
-            users = users.filter(u => u && !u.bot);
-        }
-
-        if (settings.hideBlocked && RelationshipStore) {
-            try {
-                users = users.filter(u => u && !RelationshipStore.isBlocked(u.id));
-            } catch {}
-        }
-
-        return h(this.ReactorsC, {
-            count: effectiveCount,
-            channel: channel || {},
-            users,
+        const users = storeUsers.length > 0 ? storeUsers : this._getCachedReactionUsers(reactionKey);
+        return this._h(this.ReactorsC, {
+            containerRef,
+            count,
+            users: this._filterUsers(users, settings),
             max: settings.max,
             size: settings.avatarSize,
             overlap: settings.avatarOverlap / 100,
-            spacing: settings.avatarSpacing / 100
+            spacing: settings.avatarSpacing / 100,
+            guildId: channel && channel.guild_id
         });
     }
 
-    _renderReactorsElement(message, emoji, count, type) {
-        return this._h(this.RootC, { message, emoji, count, type });
+    _autoFetchAvailable() {
+        const { RestAPI, Dispatcher, UserStore } = this.mods;
+        return !this.fetchDisabled && !!(RestAPI && Dispatcher && UserStore);
     }
 
-    _startStrategyB() {
-        if (typeof document === "undefined" || typeof MutationObserver !== "function") {
-            this._logError("Strategy B: DOM APIs are unavailable.");
-            return false;
+    _requestReactors(element, request) {
+        if (!this._autoFetchAvailable() || this.fetchedKeys.has(request.key)) return () => {};
+
+        const entry = { ...request, element, visible: false, queued: false };
+        this.fetchRequests.set(element, entry);
+        this._getVisibilityObserver().observe(element);
+
+        return () => {
+            if (this.fetchRequests.get(element) === entry) this.fetchRequests.delete(element);
+            if (this.visibilityObserver) this.visibilityObserver.unobserve(element);
+            this._dequeue(entry);
+        };
+    }
+
+    _getVisibilityObserver() {
+        if (!this.visibilityObserver) {
+            this.visibilityObserver = new IntersectionObserver(
+                entries => this._onVisibilityChange(entries),
+                { rootMargin: "200px 0px" }
+            );
+        }
+        return this.visibilityObserver;
+    }
+
+    _onVisibilityChange(entries) {
+        for (const item of entries) {
+            const entry = this.fetchRequests.get(item.target);
+            if (!entry) continue;
+            entry.visible = item.isIntersecting;
+            if (entry.visible) this._enqueue(entry);
+            else this._dequeue(entry);
+        }
+        this._pumpQueue();
+    }
+
+    _enqueue(entry) {
+        if (entry.queued || this.fetchedKeys.has(entry.key)) return;
+        entry.queued = true;
+        this.fetchQueue.push(entry);
+    }
+
+    _dequeue(entry) {
+        if (!entry.queued) return;
+        entry.queued = false;
+        const index = this.fetchQueue.indexOf(entry);
+        if (index !== -1) this.fetchQueue.splice(index, 1);
+    }
+
+    _clearFetchQueue() {
+        for (const entry of this.fetchQueue) entry.queued = false;
+        this.fetchQueue = [];
+    }
+
+    _markFetched(key) {
+        this.fetchedKeys.delete(key);
+        this.fetchedKeys.add(key);
+        if (this.fetchedKeys.size > this.fetchedKeysMax) {
+            this.fetchedKeys.delete(this.fetchedKeys.values().next().value);
+        }
+    }
+
+    _pumpQueue() {
+        if (!this.started || this.fetchBusy || this.fetchTimer !== null || this.fetchQueue.length === 0) return;
+
+        const wait = this.fetchPausedUntil - Date.now();
+        if (wait > 0) {
+            this.fetchTimer = setTimeout(() => {
+                this.fetchTimer = null;
+                this._pumpQueue();
+            }, wait);
+            return;
         }
 
+        let entry = null;
+        while (this.fetchQueue.length > 0) {
+            const candidate = this.fetchQueue.pop();
+            candidate.queued = false;
+            if (!this.fetchedKeys.has(candidate.key)) {
+                entry = candidate;
+                break;
+            }
+        }
+        if (!entry || !this._autoFetchAvailable() || !this.settings.autoFetch) return;
+        this._fetchReactors(entry);
+    }
+
+    _fetchReactors(entry) {
+        const generation = this.fetchGeneration;
+        const emojiKey = entry.emoji.id ? `${entry.emoji.name}:${entry.emoji.id}` : entry.emoji.name;
+        this.fetchBusy = true;
+        this._markFetched(entry.key);
+
+        let request;
+        try {
+            request = this.mods.RestAPI.get({
+                url: `/channels/${entry.channelId}/messages/${entry.messageId}/reactions/${encodeURIComponent(emojiKey)}`,
+                query: { limit: 100, type: entry.type },
+                oldFormErrors: true
+            });
+        } catch (err) {
+            request = Promise.reject(err);
+        }
+
+        Promise.resolve(request).then(response => {
+            if (generation !== this.fetchGeneration) return;
+            try {
+                this._storeFetchedReactors(entry, response);
+            } catch (err) {
+                this._logError("Failed to store fetched reactors:", err);
+            }
+        }, error => {
+            if (generation !== this.fetchGeneration) return;
+            this._handleFetchError(entry, error);
+        }).finally(() => {
+            if (generation !== this.fetchGeneration) return;
+            this.fetchBusy = false;
+            this.fetchTimer = setTimeout(() => {
+                this.fetchTimer = null;
+                this._pumpQueue();
+            }, this.fetchInterval);
+        });
+    }
+
+    _storeFetchedReactors(entry, response) {
+        const { Dispatcher, UserStore } = this.mods;
+        const users = Array.isArray(response && response.body) ? response.body.filter(user => user && user.id) : [];
+        for (const user of users) {
+            if (!UserStore.getUser(user.id)) Dispatcher.dispatch({ type: "USER_UPDATE", user });
+        }
+        Dispatcher.dispatch({
+            type: "MESSAGE_REACTION_ADD_USERS",
+            channelId: entry.channelId,
+            messageId: entry.messageId,
+            users,
+            emoji: entry.emoji,
+            reactionType: entry.type
+        });
+    }
+
+    _handleFetchError(entry, error) {
+        const status = Number(error && error.status);
+
+        if (status === 429) {
+            const retryAfter = Number(error.body && error.body.retry_after);
+            const delay = Number.isFinite(retryAfter) ? retryAfter * 1000 : 5000;
+            this.fetchPausedUntil = Date.now() + Math.min(60000, Math.max(1000, delay));
+            this.fetchedKeys.delete(entry.key);
+            if (this.fetchRequests.get(entry.element) === entry && entry.visible) this._enqueue(entry);
+            return;
+        }
+
+        if (!Number.isFinite(status) || status <= 0) {
+            this.fetchDisabled = true;
+            this._clearFetchQueue();
+            this._logError("Automatic reactor loading stopped after an unexpected error:", error);
+            return;
+        }
+
+        this._logError(`Failed to load reactors (HTTP ${status}).`);
+    }
+
+    _startObserver() {
         const root = document.querySelector("#app-mount") || document.body;
         if (!root) {
-            this._logError("Strategy B: could not find an app root to observe.");
+            this._logError("Could not find the app root to observe.");
             return false;
         }
 
-        try {
-            this.observer = new MutationObserver(this._onMutations);
-            this.observer.observe(root, {
-                childList: true,
-                subtree: true,
-                characterData: true,
-                attributes: true,
-                attributeFilter: ["aria-label", "data-count"]
-            });
-            this.observedRoot = root;
-            this._queueScanRoot(root);
-            return true;
-        } catch (err) {
-            this._logError("Strategy B: failed to observe app root:", err);
-            this.observer = null;
-            this.observedRoot = null;
-            return false;
-        }
-    }
-
-    _queueScanRoot(root) {
-        if (!root || root.nodeType !== 1) return;
-
-        for (const queuedRoot of this.pendingScanRoots) {
-            if (queuedRoot === root || (queuedRoot.contains && queuedRoot.contains(root))) return;
-            if (root.contains && root.contains(queuedRoot)) {
-                this.pendingScanRoots.delete(queuedRoot);
-            }
-        }
-
+        this.observer = new MutationObserver(this._onMutations);
+        this.observer.observe(root, { childList: true, subtree: true });
         this.pendingScanRoots.add(root);
         this._scheduleScan();
-    }
-
-    _queueCleanupRoot(root) {
-        if (!root || root.nodeType !== 1) return;
-
-        for (const queuedRoot of this.pendingCleanupRoots) {
-            if (queuedRoot === root || (queuedRoot.contains && queuedRoot.contains(root))) return;
-            if (root.contains && root.contains(queuedRoot)) {
-                this.pendingCleanupRoots.delete(queuedRoot);
-            }
-        }
-
-        this.pendingCleanupRoots.add(root);
-        this._scheduleScan();
-    }
-
-    _scheduleScan() {
-        if (this.scanFrameId !== null || typeof requestAnimationFrame !== "function") return;
-
-        this.scanFrameId = requestAnimationFrame(() => {
-            this.scanFrameId = null;
-            const roots = Array.from(this.pendingScanRoots);
-            const cleanupRoots = Array.from(this.pendingCleanupRoots);
-            this.pendingScanRoots.clear();
-            this.pendingCleanupRoots.clear();
-
-            if (!this.started) return;
-
-            for (const root of cleanupRoots) {
-                if (!root.isConnected) this._cleanupRemovedPills(root);
-            }
-            this._pruneDomRoots();
-
-            for (const root of roots) {
-                if (root.isConnected) this._scanForPills(root);
-            }
-        });
-    }
-
-    _pruneDomRoots() {
-        for (const [pillEl, entry] of Array.from(this.domRoots.entries())) {
-            if (pillEl.isConnected && entry.container && entry.container.isConnected) continue;
-            this._teardownDomEntry(entry);
-            this.domRoots.delete(pillEl);
-        }
+        return true;
     }
 
     _onMutations(mutations) {
         if (!this.started) return;
 
-        const pillSelector = 'button[class*="reaction"], [role="button"][class*="reaction"]';
-        const queuePillForTarget = target => {
-            if (!target) return;
-
-            const element = target.nodeType === 1
-                ? target
-                : target.parentElement || target.parentNode;
-            if (!element) return;
-
-            try {
-                const pill = element.matches && element.matches(pillSelector)
-                    ? element
-                    : element.closest && element.closest(pillSelector);
-                if (pill) this._queueScanRoot(pill);
-            } catch {}
-        };
-
-        for (const mutation of mutations || []) {
-            for (const node of mutation.addedNodes || []) {
-                if (node && node.nodeType === 1) this._queueScanRoot(node);
+        for (const mutation of mutations) {
+            for (const node of mutation.addedNodes) {
+                if (node.nodeType === 1 && !node.closest(`.${CONTAINER_CLASS}`)) this.pendingScanRoots.add(node);
             }
-            for (const node of mutation.removedNodes || []) {
-                if (node && node.nodeType === 1) this._queueCleanupRoot(node);
-            }
-            if (mutation.type === "attributes" || mutation.type === "characterData") {
-                queuePillForTarget(mutation.target);
-            }
+            if (mutation.removedNodes.length > 0) this.pruneRequested = true;
         }
+
+        if (this.pendingScanRoots.size > 0 || this.pruneRequested) this._scheduleScan();
     }
 
-    _scanForPills(root) {
-        try {
+    _scheduleScan() {
+        if (this.scanFrameId !== null) return;
+
+        this.scanFrameId = requestAnimationFrame(() => {
+            this.scanFrameId = null;
+            if (!this.started) return;
+
+            if (this.pruneRequested) {
+                this.pruneRequested = false;
+                this._pruneDomRoots();
+            }
+
             const pills = new Set();
-            if (root.matches && this._isReactionPillCandidate(root)) pills.add(root);
-            if (root.querySelectorAll) {
-                root.querySelectorAll('button[class*="reaction"], [role="button"][class*="reaction"]').forEach(el => pills.add(el));
+            for (const root of this.pendingScanRoots) {
+                if (!root.isConnected) continue;
+                if (root.matches(PILL_SELECTOR)) pills.add(root);
+                for (const element of root.querySelectorAll(PILL_SELECTOR)) pills.add(element);
             }
-            for (const pill of pills) {
-                this._injectIntoPill(pill);
-            }
-        } catch (err) {
-            this._logError("Error scanning for reaction pills:", err);
-        }
-    }
+            this.pendingScanRoots.clear();
 
-    _isReactionPillCandidate(element) {
-        if (!(element instanceof HTMLElement)) return false;
-        if (element.classList.contains("bd-who-reacted__container")) return false;
-        const className = typeof element.className === "string" ? element.className : "";
-        const isButton = element.tagName === "BUTTON" || element.getAttribute("role") === "button";
-        return isButton && className.toLowerCase().includes("reaction");
-    }
-
-    _cleanupRemovedPills(root) {
-        try {
-            for (const [el, frameId] of Array.from(this.pillRetryFrames.entries())) {
-                if (root === el || (root.contains && root.contains(el))) {
-                    cancelAnimationFrame(frameId);
-                    this.pillRetryFrames.delete(el);
-                }
-            }
-            for (const [el, entry] of Array.from(this.domRoots.entries())) {
-                if (root === el || (root.contains && root.contains(el))) {
-                    this._teardownDomEntry(entry);
-                    this.domRoots.delete(el);
-                }
-            }
-        } catch (err) {
-            this._logError("Error cleaning up removed pills:", err);
-        }
-    }
-
-    _schedulePillRetry(pillEl, attempt) {
-        if (
-            !this.started ||
-            !pillEl ||
-            !pillEl.isConnected ||
-            attempt > this.maxPillRetries ||
-            typeof requestAnimationFrame !== "function"
-        ) return;
-        if (this.pillRetryFrames.has(pillEl)) return;
-
-        const frameId = requestAnimationFrame(() => {
-            this.pillRetryFrames.delete(pillEl);
-            if (this.started && pillEl.isConnected) this._injectIntoPill(pillEl, attempt);
+            for (const pill of pills) this._injectIntoPill(pill, 0);
         });
-        this.pillRetryFrames.set(pillEl, frameId);
+    }
+
+    _pruneDomRoots() {
+        for (const [pill, entry] of this.domRoots) {
+            if (pill.isConnected && entry.container.isConnected) continue;
+            this._teardownDomEntry(entry);
+            this.domRoots.delete(pill);
+        }
+        for (const [pill, frameId] of this.pillRetryFrames) {
+            if (pill.isConnected) continue;
+            cancelAnimationFrame(frameId);
+            this.pillRetryFrames.delete(pill);
+        }
+    }
+
+    _schedulePillRetry(pill, attempt) {
+        if (this.pillRetryFrames.has(pill)) return;
+        const frameId = requestAnimationFrame(() => {
+            this.pillRetryFrames.delete(pill);
+            if (this.started) this._injectIntoPill(pill, attempt);
+        });
+        this.pillRetryFrames.set(pill, frameId);
     }
 
     _teardownDomEntry(entry) {
-        if (!entry) return;
-
         try {
-            if (entry.root && typeof entry.root.unmount === "function") {
-                entry.root.unmount();
-            } else if (
-                typeof BdApi !== "undefined" &&
-                BdApi.ReactDOM &&
-                typeof BdApi.ReactDOM.unmountComponentAtNode === "function"
-            ) {
-                BdApi.ReactDOM.unmountComponentAtNode(entry.container);
-            }
+            entry.root.unmount();
         } catch (err) {
-            this._logError("Error unmounting DOM root:", err);
+            this._logError("Failed to unmount reactors:", err);
         }
-
-        try {
-            if (entry.container && entry.container.parentNode) {
-                entry.container.parentNode.removeChild(entry.container);
-            }
-        } catch (err) {
-            this._logError("Error removing DOM root:", err);
-        }
-
-        try {
-            if (entry.pillEl && entry.pillEl.classList) {
-                entry.pillEl.classList.remove("bd-who-reacted__pill");
-            }
-        } catch (err) {
-            this._logError("Error restoring reaction pill class:", err);
-        }
+        entry.container.remove();
+        entry.pill.classList.remove(PILL_CLASS);
     }
 
-    _injectIntoPill(pillEl, retryAttempt = 0) {
-        if (!pillEl || pillEl.isConnected === false) return;
-        if (retryAttempt === 0 && this.pillRetryFrames.has(pillEl)) return;
-        if (retryAttempt === 0) this.diag.strategyB.pillsSeen++;
+    _injectIntoPill(pill, attempt) {
+        if (!pill.isConnected || this.ignoredPills.has(pill)) return;
+        if (attempt === 0 && this.pillRetryFrames.has(pill)) return;
 
-        let props = null;
-        let internalInstance = null;
-        try {
-            if (
-                typeof BdApi === "undefined" ||
-                !BdApi.ReactUtils ||
-                typeof BdApi.ReactUtils.getInternalInstance !== "function"
-            ) return;
-
-            internalInstance = BdApi.ReactUtils.getInternalInstance(pillEl);
-            props = this._findReactionPropsInFiber(internalInstance, 25);
-        } catch (err) {
-            this._logError("Strategy B: fiber walk failed:", err);
+        const existing = this.domRoots.get(pill);
+        if (existing) {
+            if (existing.container.isConnected && existing.container.parentNode === pill) return;
+            this._teardownDomEntry(existing);
+            this.domRoots.delete(pill);
         }
 
-        if (!props || !props.message || !props.emoji) {
-            this.diag.strategyB.fiberPropsMissing++;
-            if (!this.diag.strategyB.sampleFiberPropKeys && internalInstance) {
-                this.diag.strategyB.sampleFiberPropKeys = this._sampleFiberPropKeys(internalInstance);
-            }
-            this._saveDiag(false);
-            this._schedulePillRetry(pillEl, retryAttempt + 1);
+        const props = this._readPillProps(pill);
+        if (!props) {
+            if (attempt >= this.maxPillRetries) this.ignoredPills.add(pill);
+            else this._schedulePillRetry(pill, attempt + 1);
             return;
         }
 
-        this.diag.strategyB.fiberPropsFound++;
-
+        const message = props.message;
         let channelId = null;
         try {
-            channelId = typeof props.message.getChannelId === "function"
-                ? props.message.getChannelId()
-                : props.message.channel_id;
-        } catch (err) {
-            channelId = null;
-        }
-
-        const reactionKey = this._reactionKey(channelId, props.message.id, props.emoji, props.type);
-        const renderKey = `${reactionKey}:${String(props.count == null ? 0 : props.count)}`;
-        const existing = this.domRoots.get(pillEl);
-
-        if (existing && existing.renderKey === renderKey && existing.container && existing.container.isConnected !== false) {
+            channelId = typeof message.getChannelId === "function" ? message.getChannelId() : message.channel_id;
+        } catch {}
+        if (!channelId || !message.id) {
+            this.ignoredPills.add(pill);
             return;
         }
 
-        if (this._exceedsReactionThresholds(props.message)) {
-            if (existing) {
-                this._teardownDomEntry(existing);
-                this.domRoots.delete(pillEl);
-            }
-            return;
-        }
+        for (const stale of pill.querySelectorAll(`:scope > .${CONTAINER_CLASS}`)) stale.remove();
 
-        if (existing) {
-            this._teardownDomEntry(existing);
-            this.domRoots.delete(pillEl);
-        }
+        const container = document.createElement("span");
+        container.className = CONTAINER_CLASS;
+        pill.classList.add(PILL_CLASS);
+        pill.appendChild(container);
 
         try {
-            const staleContainer = pillEl.querySelector && pillEl.querySelector(".bd-who-reacted__container");
-            if (staleContainer) this._teardownDomEntry({ container: staleContainer, pillEl });
+            const root = BdApi.ReactDOM.createRoot(container);
+            root.render(this._h(this.RootC, {
+                channelId,
+                messageId: message.id,
+                emoji: props.emoji,
+                type: props.type,
+                fallbackMessage: message,
+                fallbackCount: props.count
+            }));
+            this.domRoots.set(pill, { root, container, pill });
         } catch (err) {
-            this._logError("Strategy B: failed to remove stale container:", err);
-        }
-
-        let container = null;
-        try {
-            if (typeof document === "undefined" || typeof document.createElement !== "function") {
-                return;
-            }
-
-            container = document.createElement("span");
-            container.className = "bd-who-reacted__container";
-            pillEl.classList.add("bd-who-reacted__pill");
-            pillEl.appendChild(container);
-
-            const element = this._renderReactorsElement(props.message, props.emoji, props.count, props.type);
-            const ReactDOM = typeof BdApi !== "undefined" ? BdApi.ReactDOM : null;
-            let root = null;
-
-            if (ReactDOM && typeof ReactDOM.createRoot === "function") {
-                root = ReactDOM.createRoot(container);
-                root.render(element);
-            } else if (ReactDOM && typeof ReactDOM.render === "function") {
-                ReactDOM.render(element, container);
-            } else {
-                throw new Error("No usable ReactDOM render API found.");
-            }
-
-            this.diag.strategyB.rendersOk++;
-            this._saveDiag(false);
-            this.domRoots.set(pillEl, { root, container, pillEl, reactionKey, renderKey });
-        } catch (err) {
-            this.diag.strategyB.renderErrors++;
-            this._logError("Strategy B: failed to render into pill:", err);
-            if (container) {
-                try { container.remove(); } catch {}
-            }
-            try { pillEl.classList.remove("bd-who-reacted__pill"); } catch {}
+            this._logError("Failed to render reactors into a reaction:", err);
+            container.remove();
+            pill.classList.remove(PILL_CLASS);
         }
     }
 
-    _sampleFiberPropKeys(fiber) {
-        const samples = [];
+    _readPillProps(pill) {
         try {
-            let node = fiber;
-            let depth = 0;
-            while (node && depth < 12 && samples.length < 6) {
-                const props = node.memoizedProps || node.pendingProps;
-                if (props && typeof props === "object" && !Array.isArray(props)) {
-                    const keys = Object.keys(props).slice(0, 15);
-                    if (keys.length) samples.push({ depth, keys });
-                }
-                node = node.return;
-                depth++;
-            }
-        } catch {}
-        return samples;
+            return this._findReactionPropsInFiber(BdApi.ReactUtils.getInternalInstance(pill), 25);
+        } catch (err) {
+            this._logError("Failed to read reaction props:", err);
+            return null;
+        }
     }
 
     _findReactionPropsInFiber(fiber, maxDepth) {
+        const visited = new Set();
         let node = fiber;
         let depth = 0;
-        const limit = Math.max(1, Number(maxDepth) || 25);
-        const visited = new Set();
 
-        while (node && depth < limit) {
-            if (visited.has(node)) break;
+        while (node && depth < maxDepth && !visited.has(node)) {
             visited.add(node);
+            const props = [node.memoizedProps, node.pendingProps].find(candidate =>
+                candidate &&
+                typeof candidate === "object" &&
+                candidate.message &&
+                (candidate.emoji || (candidate.reaction && candidate.reaction.emoji))
+            );
 
-            let props = null;
-            try {
-                const candidates = [node.memoizedProps, node.pendingProps];
-                props = candidates.find(candidate => candidate && typeof candidate === "object" && (
-                    (candidate.message && candidate.emoji) ||
-                    (candidate.message && candidate.reaction && candidate.reaction.emoji)
-                )) || null;
-            } catch (err) {
-                props = null;
+            if (props && props.emoji) {
+                return { message: props.message, emoji: props.emoji, count: props.count ?? 0, type: props.type ?? 0 };
             }
-
-            if (props && props.message && props.emoji) {
-                return {
-                    message: props.message,
-                    emoji: props.emoji,
-                    count: props.count == null ? 0 : props.count,
-                    type: props.type == null ? 0 : props.type
-                };
-            }
-            if (props && props.message && props.reaction && props.reaction.emoji) {
+            if (props) {
                 return {
                     message: props.message,
                     emoji: props.reaction.emoji,
-                    count: props.reaction.count == null ? 0 : props.reaction.count,
-                    type: props.type == null ? (props.reaction.type || 0) : props.type
+                    count: props.reaction.count ?? 0,
+                    type: props.type ?? props.reaction.type ?? 0
                 };
             }
 
-            try {
-                node = node.return;
-            } catch (err) {
-                node = null;
-            }
+            node = node.return;
             depth++;
         }
 
         return null;
-    }
-
-    _buildSettingsPanelViaBdApi() {
-        const self = this;
-
-        const pctMarker = v => `${Number(v).toFixed(2)}%`;
-        const pxMarker = v => `${v}px`;
-        const thresholdMarker = v => {
-            if (v === 0) return "Off";
-            if (v >= 1000) return `${v / 1000}k`;
-            return `${v}`;
-        };
-
-        const settingsSchema = [
-            {
-                type: "category",
-                id: "appearance",
-                name: "Appearance",
-                collapsible: false,
-                settings: [
-                    {
-                        type: "slider",
-                        id: "max",
-                        name: "Maximum Avatars",
-                        note: "Sets the maximum number of avatars shown per emoji.",
-                        value: self.settings.max,
-                        min: 1,
-                        max: 20,
-                        step: 1,
-                        onChange: v => self.updateSetting("max", v)
-                    },
-                    {
-                        type: "slider",
-                        id: "avatarSize",
-                        name: "Avatar Size",
-                        note: "Sets the size of the avatars.",
-                        value: self.settings.avatarSize,
-                        min: 8,
-                        max: 48,
-                        step: 1,
-                        markers: [8, 12, 16, 20, 24, 32, 40, 48],
-                        onMarkerRender: pxMarker,
-                        onChange: v => self.updateSetting("avatarSize", v)
-                    },
-                    {
-                        type: "slider",
-                        id: "avatarOverlap",
-                        name: "Avatar Overlap",
-                        note: "Sets how much an avatar covers the previous one.",
-                        value: self.settings.avatarOverlap,
-                        min: 0,
-                        max: 100,
-                        step: 1,
-                        onMarkerRender: pctMarker,
-                        onChange: v => self.updateSetting("avatarOverlap", v)
-                    },
-                    {
-                        type: "slider",
-                        id: "avatarSpacing",
-                        name: "Avatar Spacing",
-                        note: "Sets the gap between two avatars.",
-                        value: self.settings.avatarSpacing,
-                        min: 0,
-                        max: 50,
-                        step: 1,
-                        onMarkerRender: pctMarker,
-                        onChange: v => self.updateSetting("avatarSpacing", v)
-                    }
-                ]
-            },
-            {
-                type: "category",
-                id: "thresholds",
-                name: "Thresholds",
-                collapsible: false,
-                settings: [
-                    {
-                        type: "slider",
-                        id: "emojiThreshold",
-                        name: "Emoji Threshold",
-                        note: "Hides the reactors when the number of distinct emoji reactions exceeds the threshold. 0 disables this.",
-                        value: self.settings.emojiThreshold,
-                        min: 0,
-                        max: 20,
-                        step: 1,
-                        onMarkerRender: thresholdMarker,
-                        onChange: v => self.updateSetting("emojiThreshold", v)
-                    },
-                    {
-                        type: "slider",
-                        id: "reactionsTotalThreshold",
-                        name: "Reactions Total Threshold",
-                        note: "Hides the reactors when the sum of all reaction counts exceeds the threshold. 0 disables this.",
-                        value: self.settings.reactionsTotalThreshold,
-                        min: 0,
-                        max: 10000,
-                        step: 10,
-                        onMarkerRender: thresholdMarker,
-                        onChange: v => self.updateSetting("reactionsTotalThreshold", v)
-                    },
-                    {
-                        type: "slider",
-                        id: "reactionsPerEmojiThreshold",
-                        name: "Reactions per Emoji Threshold",
-                        note: "Hides the reactors when a single emoji's reaction count exceeds the threshold. 0 disables this.",
-                        value: self.settings.reactionsPerEmojiThreshold,
-                        min: 0,
-                        max: 500,
-                        step: 5,
-                        onMarkerRender: thresholdMarker,
-                        onChange: v => self.updateSetting("reactionsPerEmojiThreshold", v)
-                    }
-                ]
-            },
-            {
-                type: "category",
-                id: "filters",
-                name: "Filters",
-                collapsible: false,
-                settings: [
-                    {
-                        type: "switch",
-                        id: "hideSelf",
-                        name: "Hide Self",
-                        value: self.settings.hideSelf,
-                        onChange: v => self.updateSetting("hideSelf", v)
-                    },
-                    {
-                        type: "switch",
-                        id: "hideBots",
-                        name: "Hide Bots",
-                        value: self.settings.hideBots,
-                        onChange: v => self.updateSetting("hideBots", v)
-                    },
-                    {
-                        type: "switch",
-                        id: "hideBlocked",
-                        name: "Hide Blocked Users",
-                        value: self.settings.hideBlocked,
-                        onChange: v => self.updateSetting("hideBlocked", v)
-                    }
-                ]
-            }
-        ];
-
-        return BdApi.UI.buildSettingsPanel({
-            settings: settingsSchema,
-            onChange: (categoryOrId, idOrValue, maybeValue) => {
-                try {
-                    if (maybeValue !== undefined) {
-                        self.updateSetting(idOrValue, maybeValue);
-                    } else {
-                        self.updateSetting(categoryOrId, idOrValue);
-                    }
-                } catch (err) {
-                    self._logError("Settings onChange handler failed:", err);
-                }
-            }
-        });
-    }
-
-    _buildFallbackSettingsPanel() {
-        const self = this;
-        const panel = document.createElement("div");
-        panel.style.display = "flex";
-        panel.style.flexDirection = "column";
-        panel.style.gap = "16px";
-        panel.style.color = "var(--text-normal)";
-
-        const addSlider = (label, id, min, max, step) => {
-            const wrap = document.createElement("div");
-            const title = document.createElement("div");
-            title.textContent = `${label}: `;
-            title.style.fontWeight = "600";
-            title.style.marginBottom = "4px";
-
-            const valueSpan = document.createElement("span");
-            valueSpan.textContent = String(self.settings[id]);
-            title.appendChild(valueSpan);
-
-            const input = document.createElement("input");
-            input.type = "range";
-            input.min = String(min);
-            input.max = String(max);
-            input.step = String(step);
-            input.value = String(self.settings[id]);
-            input.style.width = "100%";
-            input.addEventListener("input", () => {
-                const value = Number(input.value);
-                valueSpan.textContent = String(value);
-                self.updateSetting(id, value);
-            });
-
-            wrap.appendChild(title);
-            wrap.appendChild(input);
-            panel.appendChild(wrap);
-        };
-
-        const addSwitch = (label, id) => {
-            const wrap = document.createElement("label");
-            wrap.style.display = "flex";
-            wrap.style.alignItems = "center";
-            wrap.style.gap = "8px";
-
-            const input = document.createElement("input");
-            input.type = "checkbox";
-            input.checked = !!self.settings[id];
-            input.addEventListener("change", () => {
-                self.updateSetting(id, input.checked);
-            });
-
-            const span = document.createElement("span");
-            span.textContent = label;
-
-            wrap.appendChild(input);
-            wrap.appendChild(span);
-            panel.appendChild(wrap);
-        };
-
-        addSlider("Maximum Avatars", "max", 1, 20, 1);
-        addSlider("Avatar Size", "avatarSize", 8, 48, 1);
-        addSlider("Avatar Overlap (%)", "avatarOverlap", 0, 100, 1);
-        addSlider("Avatar Spacing (%)", "avatarSpacing", 0, 50, 1);
-        addSlider("Emoji Threshold (0 = off)", "emojiThreshold", 0, 20, 1);
-        addSlider("Reactions Total Threshold (0 = off)", "reactionsTotalThreshold", 0, 10000, 10);
-        addSlider("Reactions per Emoji Threshold (0 = off)", "reactionsPerEmojiThreshold", 0, 500, 5);
-        addSwitch("Hide Self", "hideSelf");
-        addSwitch("Hide Bots", "hideBots");
-        addSwitch("Hide Blocked Users", "hideBlocked");
-
-        return panel;
     }
 };

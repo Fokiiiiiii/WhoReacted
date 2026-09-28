@@ -43,9 +43,12 @@ module.exports = class WhoReacted {
         this.pillRetryFrames = new Map(); // element -> requestAnimationFrame id
         this.maxPillRetries = 2;
         this.reactionUsersCache = new Map(); // reaction key -> {users, timestamp}
-        this.reactionUsersCacheTtl = 60 * 1000;
+        this.reactionUsersCacheTtl = 10 * 1000;
         this.reactionUsersCacheMax = 100;
         this.reactionUsersCacheUserMax = 12;
+        this.reactionRefreshInterval = 8000;
+        this.reactionRefreshListeners = new Set();
+        this.reactionRefreshTimer = null;
 
         this.started = false;
 
@@ -151,6 +154,7 @@ module.exports = class WhoReacted {
 
     stop() {
         this.started = false;
+        this._stopReactionRefresh();
 
         try {
             if (typeof BdApi !== "undefined" && BdApi.Patcher && typeof BdApi.Patcher.unpatchAll === "function") {
@@ -298,6 +302,36 @@ module.exports = class WhoReacted {
         }
     }
 
+    _subscribeReactionRefresh(listener) {
+        if (typeof listener !== "function") return () => {};
+
+        this.reactionRefreshListeners.add(listener);
+        if (!this.reactionRefreshTimer && typeof setInterval === "function") {
+            this.reactionRefreshTimer = setInterval(() => {
+                for (const currentListener of Array.from(this.reactionRefreshListeners)) {
+                    try {
+                        currentListener();
+                    } catch (err) {
+                        this._logError("Reaction refresh listener threw:", err);
+                    }
+                }
+            }, this.reactionRefreshInterval);
+        }
+
+        return () => {
+            this.reactionRefreshListeners.delete(listener);
+            if (this.reactionRefreshListeners.size === 0) this._stopReactionRefresh();
+        };
+    }
+
+    _stopReactionRefresh() {
+        if (this.reactionRefreshTimer !== null && typeof clearInterval === "function") {
+            clearInterval(this.reactionRefreshTimer);
+        }
+        this.reactionRefreshTimer = null;
+        this.reactionRefreshListeners.clear();
+    }
+
     subscribe(listener) {
         this.listeners.add(listener);
         return () => this.listeners.delete(listener);
@@ -441,21 +475,24 @@ module.exports = class WhoReacted {
         return !criticalMissing;
     }
 
-    _manualUseStateFromStores(stores, getState, deps) {
+    _manualUseStateFromStores(stores, getState, deps, refreshKey) {
         const React = BdApi.React;
         const [state, setState] = React.useState(() => {
             try { return getState(); } catch (err) { return null; }
         });
+        const readState = () => {
+            try {
+                setState(getState());
+            } catch (err) {
+                this._logError("Store selector threw:", err);
+            }
+        };
 
         React.useEffect(() => {
             let disposed = false;
             const onChange = () => {
                 if (disposed) return;
-                try {
-                    setState(getState());
-                } catch (err) {
-                    this._logError("Store selector threw:", err);
-                }
+                readState();
             };
 
             const cleanups = [];
@@ -471,10 +508,10 @@ module.exports = class WhoReacted {
                     try {
                         store[addName](onChange);
                         cleanups.push(() => store[removeName](onChange));
+                        break;
                     } catch (err) {
                         this._logError(`Failed to subscribe to ${addName}:`, err);
                     }
-                    break;
                 }
             }
 
@@ -486,6 +523,11 @@ module.exports = class WhoReacted {
                 }
             };
         }, Array.isArray(deps) ? deps : []);
+
+        React.useEffect(() => {
+            if (refreshKey === undefined) return;
+            readState();
+        }, [refreshKey]);
 
         return state;
     }
@@ -748,7 +790,7 @@ module.exports = class WhoReacted {
         ));
         this.diag.data.invalidUsersSkipped += users.length - validUsers.length;
         const totalCount = Math.max(0, Number(count) || 0);
-        const usersShown = Math.min(max, validUsers.length, totalCount || validUsers.length);
+        const usersShown = Math.min(max, validUsers.length, totalCount);
         const hasMoreUsers = totalCount > usersShown;
         const userSummary = validUsers.slice(0, usersShown);
 
@@ -823,8 +865,14 @@ module.exports = class WhoReacted {
     _reactionsArray(message) {
         if (!message || !message.reactions) return [];
         if (Array.isArray(message.reactions)) return message.reactions;
-        if (typeof message.reactions.toArray === "function") return message.reactions.toArray();
-        return [];
+        if (typeof message.reactions.toArray !== "function") return [];
+
+        try {
+            const reactions = message.reactions.toArray();
+            return Array.isArray(reactions) ? reactions : [];
+        } catch (err) {
+            return [];
+        }
     }
 
     _exceedsReactionThresholds(message) {
@@ -963,6 +1011,7 @@ module.exports = class WhoReacted {
     _WhoReactedReactors(props) {
         const self = this;
         const h = this._h.bind(this);
+        const React = BdApi.React;
         const message = props.message;
         const emoji = props.emoji;
         const count = props.count;
@@ -971,6 +1020,11 @@ module.exports = class WhoReacted {
         // RULES OF HOOKS: every hook below runs unconditionally, in the same
         // order, on every render. All early-return conditions are evaluated
         // only AFTER the last hook call.
+
+        const [refreshRevision, setRefreshRevision] = React.useState(0);
+        React.useEffect(() => self._subscribeReactionRefresh(() => {
+            setRefreshRevision(revision => revision + 1);
+        }), []);
 
         const { settings } = this._useSettings();
 
@@ -998,10 +1052,11 @@ module.exports = class WhoReacted {
             [channelId]
         );
 
-        const rawUsersState = useStateFromStores(
+        const rawUsersState = self._manualUseStateFromStores(
             [ReactionStore],
             () => hideByThreshold ? [] : self._readReactionUsers(channelId, messageId, emoji, type),
-            [hideByThreshold, channelId, messageId, emoji && emoji.name, emoji && emoji.id, type]
+            [hideByThreshold, channelId, messageId, emoji && emoji.name, emoji && emoji.id, type],
+            refreshRevision
         );
         const rawUsers = Array.isArray(rawUsersState) ? rawUsersState : [];
 
@@ -1082,7 +1137,13 @@ module.exports = class WhoReacted {
 
         try {
             this.observer = new MutationObserver(this._onMutations);
-            this.observer.observe(root, { childList: true, subtree: true });
+            this.observer.observe(root, {
+                childList: true,
+                subtree: true,
+                characterData: true,
+                attributes: true,
+                attributeFilter: ["aria-label", "data-count"]
+            });
             this.observedRoot = root;
             this._queueScanRoot(root);
             return true;
@@ -1156,12 +1217,32 @@ module.exports = class WhoReacted {
     _onMutations(mutations) {
         if (!this.started) return;
 
+        const pillSelector = 'button[class*="reaction"], [role="button"][class*="reaction"]';
+        const queuePillForTarget = target => {
+            if (!target) return;
+
+            const element = target.nodeType === 1
+                ? target
+                : target.parentElement || target.parentNode;
+            if (!element) return;
+
+            try {
+                const pill = element.matches && element.matches(pillSelector)
+                    ? element
+                    : element.closest && element.closest(pillSelector);
+                if (pill) this._queueScanRoot(pill);
+            } catch (err) { /* best effort */ }
+        };
+
         for (const mutation of mutations || []) {
             for (const node of mutation.addedNodes || []) {
                 if (node && node.nodeType === 1) this._queueScanRoot(node);
             }
             for (const node of mutation.removedNodes || []) {
                 if (node && node.nodeType === 1) this._queueCleanupRoot(node);
+            }
+            if (mutation.type === "attributes" || mutation.type === "characterData") {
+                queuePillForTarget(mutation.target);
             }
         }
     }
@@ -1301,9 +1382,10 @@ module.exports = class WhoReacted {
         }
 
         const reactionKey = this._reactionKey(channelId, props.message.id, props.emoji, props.type);
+        const renderKey = `${reactionKey}:${String(props.count == null ? 0 : props.count)}`;
         const existing = this.domRoots.get(pillEl);
 
-        if (existing && existing.reactionKey === reactionKey && existing.container && existing.container.isConnected !== false) {
+        if (existing && existing.renderKey === renderKey && existing.container && existing.container.isConnected !== false) {
             return;
         }
 
@@ -1353,7 +1435,7 @@ module.exports = class WhoReacted {
 
             this.diag.strategyB.rendersOk++;
             this._saveDiag(false);
-            this.domRoots.set(pillEl, { root, container, pillEl, reactionKey });
+            this.domRoots.set(pillEl, { root, container, pillEl, reactionKey, renderKey });
         } catch (err) {
             this.diag.strategyB.renderErrors++;
             this._logError("Strategy B: failed to render into pill:", err);
@@ -1397,7 +1479,11 @@ module.exports = class WhoReacted {
 
             let props = null;
             try {
-                props = node.memoizedProps || node.pendingProps;
+                const candidates = [node.memoizedProps, node.pendingProps];
+                props = candidates.find(candidate => candidate && typeof candidate === "object" && (
+                    (candidate.message && candidate.emoji) ||
+                    (candidate.message && candidate.reaction && candidate.reaction.emoji)
+                )) || null;
             } catch (err) {
                 props = null;
             }
